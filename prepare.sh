@@ -4,7 +4,7 @@ CE=0
 prefix=../data/t2i-10M
 topk=100
 num_threads=16
-date=0707
+date=0710
 iso_thres=0.9
 recall=0.98
 

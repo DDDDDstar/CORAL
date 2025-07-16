@@ -16,6 +16,7 @@
 #include "efanna2e/parameters.h"
 #include "efanna2e/util.h"
 #include "index_pipeline.h"
+#include "fileout.h"
 
 namespace po = boost::program_options;
 
@@ -33,7 +34,7 @@ int main(int argc, char **argv) {
     uint32_t CE;
     uint32_t k;
     float iso_thres;
-    std::string cache_file;
+    std::string cache_file, log_file;
 
     po::options_description desc{"Arguments"};
     try {
@@ -78,6 +79,8 @@ int main(int argc, char **argv) {
                            "The threshold of the proportion of isolated nodes");
         desc.add_options()("cache_file", po::value<std::string>(&cache_file)->required(), 
                            "file path to cache GT");
+        desc.add_options()("log_file", po::value<std::string>(&log_file)->default_value("std")->required(), 
+                           "log file path");
         
 
         po::variables_map vm;
@@ -138,6 +141,7 @@ int main(int argc, char **argv) {
     parameters.Set<uint32_t>("CE", CE);
     parameters.Set<uint32_t>("k", k);
     parameters.Set<std::string>("cache_file", cache_file);
+    parameters.Set<std::string>("log_file", log_file);
     parameters.Set<float>("iso_thres", iso_thres);
     // std::cout << "M_bp: " << M_bp << std::endl;
     // index_pipeline.LoadLearnBaseKNN(learn_base_nn_file.c_str());
@@ -150,9 +154,9 @@ int main(int argc, char **argv) {
     auto e = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = e - s;
 
-    std::cout << "indexing time: " << diff.count() << "\n";
+    efanna2e::fo.iprint("indexing time: " + std::to_string(diff.count()));
     index_pipeline.SaveIndex(projection_index_save_file.c_str());
-    std::cout << "Save index to " << projection_index_save_file << std::endl;
+    efanna2e::fo.print("Save index to " + projection_index_save_file);
 
     return 0;
 }
