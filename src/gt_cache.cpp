@@ -17,12 +17,9 @@ GTCache::GTCache(const std::string cache_file, const uint32_t k)
 
 GTCache::~GTCache() {}
 
-void GTCache::WriteCache(uint32_t *d_knn, double time_ms)
+void GTCache::WriteCache(uint32_t *d_knn, const int batch, const double time_ms)
 {
-    BatchResult new_res;
-    new_res.knn.resize(k * BATCH);
-    cudaMemcpy(new_res.knn.data(), d_knn, BATCH * k * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    new_res.time_ms = time_ms;
+    BatchResult new_res(d_knn, k, batch, time_ms);
     results.push_back(new_res);
 
     if (++new_num >= save_thres)
@@ -54,14 +51,13 @@ void GTCache::LoadCache()
     results.reserve(n);
     for (size_t i = 0; i < n; ++i)
     {
-        BatchResult res;
-        res.knn.resize(k * BATCH);
-        if (!file.read(
-                reinterpret_cast<char *>(res.knn.data()), sizeof(uint32_t) * k * BATCH))
-        {
+        int batch;
+        if (!file.read(reinterpret_cast<char *>(&batch), sizeof(int)))
+            fo.eprint("Read batch failed, result size: " + std::to_string(results.size()));
+        BatchResult res(k, batch);
+        if (!file.read(reinterpret_cast<char *>(res.knn.data()), sizeof(uint32_t) * k * batch))
             fo.eprint(
                 "Read closest_points failed, result size: " + std::to_string(results.size()));
-        }
         if (!file.read(reinterpret_cast<char *>(&res.time_ms), sizeof(double)))
             fo.eprint("Read time failed, result size: " + std::to_string(results.size()));
 
@@ -94,6 +90,7 @@ void GTCache::SaveCache()
     fwrite(&n, sizeof(int), 1, file);
     for (const auto &res : results)
     {
+        fwrite(&res.batch, sizeof(int), 1, file);
         fwrite(res.knn.data(), sizeof(uint32_t), k * BATCH, file);
         fwrite(&res.time_ms, sizeof(double), 1, file);
     }

@@ -4,15 +4,18 @@ project(efanna2e
     VERSION 1.0
     LANGUAGES CXX CUDA
 )
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)  # 开启可分离编译
 set(CMAKE_CUDA_ARCHITECTURES "80")
-set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda-11.4")
+set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda-12.8")
 find_package(CUDA REQUIRED)
-include_directories(${CUDA_INCLUDE_DIRS} /usr/local/cuda-11.4/include)
-# link_directories(${CUDA_LIBRARY_DIRS}) 
+include_directories(${CUDA_INCLUDE_DIRS} /usr/local/cuda-12.8/include)
 
 enable_language(CUDA)
 include_directories(${PROJECT_SOURCE_DIR}/include)
-include_directories(${PROJECT_SOURCE_DIR}/thirdparty/cub)
 
 find_package(Boost COMPONENTS program_options REQUIRED)
 message(STATUS "Boost_INCLUDE_DIRS: ${Boost_INCLUDE_DIRS}")

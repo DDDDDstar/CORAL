@@ -1,92 +1,142 @@
 #include <future>
+#include <filesystem>
 
 #include "fileout.h"
 
-using namespace efanna2e;
-
-FileOut fo;
-
-void FileOut::Init(std::string filename)
+namespace efanna2e
 {
-    if (filename == "std")
-        return;
-    file_.open(filename);
-    if (!file_)
-    { // 检查文件是否成功打开
-        std::cerr << "无法打开文件！" << std::endl;
-        exit(EXIT_FAILURE);
+
+    FileOut fo;
+
+    void FileOut::Init(std::string filename)
+    {
+        if (filename == "std")
+            return;
+
+        std::filesystem::path dir_path = std::filesystem::path(filename).parent_path();
+        if (!dir_path.empty() && !std::filesystem::exists(dir_path))
+            std::filesystem::create_directories(dir_path); // 递归创建目录
+
+        file_.open(filename);
+        if (!file_)
+        { // 检查文件是否成功打开
+            std::cerr << "无法打开文件！" << std::endl;
+            exit(EXIT_FAILURE);
+        }
     }
-}
 
-FileOut::FileOut() {}
+    FileOut::FileOut() : worker(&FileOut::process_messages, this) {}
 
-FileOut::~FileOut()
-{
-    if (file_.is_open())
-        file_.close();
-}
+    FileOut::~FileOut()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop_flag = true;
+        }
+        cv.notify_one();
+        if (worker.joinable())
+            worker.join();
 
-// 打印消息到文件或标准输出
-void FileOut::print_flash(std::string msg)
-{
-    std::async(std::launch::async, [this, msg]()
-               {
-        std::lock_guard<std::mutex> lock(mtx);
-        // 如果文件已打开，则将消息写入文件，否则写入标准输出
-        auto &out = file_.is_open() ? file_ : std::cout;
-        // 将消息写入输出流，并换行
-        out << msg << std::endl; });
-}
+        if (file_.is_open())
+            file_.close();
+    }
 
-void FileOut::print(std::string msg)
-{
-    std::async(std::launch::async, [this, msg]()
-               {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto &out = file_.is_open() ? file_ : std::cout;
-        out << msg << "\n"; });
-}
+    // 后台消息处理线程
+    void FileOut::process_messages()
+    {
+        while (true)
+        {
+            std::string msg;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [this]
+                        { return !msg_queue.empty() || stop_flag; });
 
-void FileOut::iprint(std::string msg)
-{
-    std::async(std::launch::async, [this, msg]()
-               {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto &out = file_.is_open() ? file_ : std::cout;
-        out << "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n";
-        out << msg << "\n";
-        out << ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>" << std::endl; });
-}
+                if (stop_flag && msg_queue.empty())
+                    break;
+                if (msg_queue.empty())
+                    continue;
 
-void FileOut::eprint(std::string msg)
-{
-    std::lock_guard<std::mutex> lock(mtx);
-    auto &out = file_.is_open() ? file_ : std::cout;
-    out << "--------------------ERROR--------------------\n";
-    out << msg << "\n";
-    out << "---------------------------------------------" << std::endl;
-    exit(EXIT_FAILURE);
-}
+                msg = std::move(msg_queue.front());
+                msg_queue.pop();
+            }
 
-void FileOut::qprint(
-    const int head, int tail, const int len, const int r, const int w)
-{
-    std::async(std::launch::async, [this, head, tail, len, r, w]()
-               {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto &out = file_.is_open() ? file_ : std::cout;
-        out << "KNN QUEUE: [ ";
-        for (int i = 0; i < len; ++i) {
-            if (i == r) out << "x";
-            else if (i == w) out << "*";
-            else if (head == tail) out << "_";
-            else if (head < tail) {
-                if (i < head || i >= tail) out << "_";
-                else out << i;
-            } else {
-                if (i < head && i >= tail) out << "_";
-                else out << i;
+            auto &out = file_.is_open() ? file_ : std::cout;
+            out << msg << std::endl;
+        }
+    }
+
+    void FileOut::print(std::string msg)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            msg_queue.push(msg);
+        }
+        cv.notify_one();
+    }
+
+    void FileOut::iprint(std::string msg)
+    {
+        std::string decorated_msg =
+            "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n" +
+            msg + "\n" +
+            ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>";
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            msg_queue.push(decorated_msg);
+        }
+        cv.notify_one();
+    }
+
+    void FileOut::eprint(std::string msg)
+    {
+        std::string decorated_msg =
+            "--------------------ERROR--------------------\n" +
+            msg + "\n" +
+            "---------------------------------------------";
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto &out = file_.is_open() ? file_ : std::cout;
+            out << decorated_msg << std::endl;
+        }
+        exit(EXIT_FAILURE); // 错误消息直接退出
+    }
+
+    void FileOut::qprint(
+        const int head, const int tail, const int len, const int r, const int w)
+    {
+        std::string queue_state = "KNN QUEUE: [ ";
+        for (int i = 0; i < len; ++i)
+        {
+            if (i == r)
+                queue_state += "x";
+            else if (i == w)
+                queue_state += "*";
+            else if (head == tail)
+                queue_state += "_";
+            else if (head < tail)
+            {
+                if (i < head || i >= tail)
+                    queue_state += "_";
+                else
+                    queue_state += std::to_string(i);
+            }
+            else
+            {
+                if (i < head && i >= tail)
+                    queue_state += "_";
+                else
+                    queue_state += std::to_string(i);
             }
         }
-        out << " ]" << std::endl; });
+        queue_state += " ]";
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            msg_queue.push(queue_state);
+        }
+        cv.notify_one();
+    }
 }

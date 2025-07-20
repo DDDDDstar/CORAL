@@ -1,5 +1,3 @@
-#include "index_pipeline.h"
-
 #include <omp.h>
 #include <bitset>
 #include <chrono>
@@ -15,6 +13,7 @@
 #include "efanna2e/parameters.h"
 #include "candidates.h"
 #include "fileout.h"
+#include "index_pipeline.h"
 
 // define likely unlikely
 #define likely(x) __builtin_expect(!!(x), 1)
@@ -29,12 +28,8 @@ using namespace efanna2e;
 IndexPipeline::IndexPipeline(const size_t dimension, const size_t n, Metric m, Index *initializer)
     : Index(dimension, n, m), initializer_{initializer}
 {
-    // 初始化L2距离
-    // 如果使用余弦相似度，则需要归一化
     if (m == efanna2e::COSINE)
-    {
         need_normalize = true;
-    }
 }
 
 IndexPipeline::~IndexPipeline() {}
@@ -46,6 +41,7 @@ void IndexPipeline::Search(const float *query, const float *x, size_t k, const P
 void IndexPipeline::BuildPipeline(size_t n_sq, float *sq_data, size_t n_bp, float *bp_data,
                                   Parameters &parameters)
 {
+    std::cout << "__cplusplus: " << __cplusplus << std::endl;
     SetParameters(parameters);
     auto s = std::chrono::high_resolution_clock::now();
     uint32_t M_pjbp = parameters.Get<uint32_t>("M_pjbp");
@@ -65,6 +61,8 @@ void IndexPipeline::BuildPipeline(size_t n_sq, float *sq_data, size_t n_bp, floa
     u32_nd_sq_ = static_cast<uint32_t>(nd_sq_);
     learn_base_knn_.resize(u32_nd_sq_);
 
+    ProjectionReserveSpace();
+
     GPUPrepare();
 
     KNN_Queue knn_queue(k, 10);
@@ -79,25 +77,6 @@ void IndexPipeline::BuildPipeline(size_t n_sq, float *sq_data, size_t n_bp, floa
     CUDA_CHECK(cudaDeviceSynchronize());
     fo.print("All done. Copying graph from GPU...");
 
-    // 拷贝数据回 host
-    std::vector<int> h_in_deg(u32_nd_);
-    std::vector<int> h_adj(u32_nd_ * M_pjbp);
-    gpufuncs->get_graph_data(h_in_deg, h_adj);
-
-    ProjectionReserveSpace();
-    for (int i = 0; i < u32_nd_; i++)
-    {
-        int deg = h_in_deg[i] <= k ? h_in_deg[i] : k;
-        projection_graph_[i].reserve(deg);
-        for (int j = 0; j < deg; j++)
-        {
-            int nei = h_adj[i * k + j];
-            if (nei >= 0)
-                projection_graph_[i].push_back((uint32_t)nei);
-        }
-    }
-    // CUDA_CHECK(cudaFree(d_out_graph));
-    // CUDA_CHECK(cudaFree(d_out_deg));
     GPUFree();
     // stats projection graph degree
     float avg_degree = 0;
@@ -146,50 +125,19 @@ void IndexPipeline::GPUPrepare()
     gpufuncs = new GPUFuncs(h_base, u32_nd_, dimension_, k, max_degree);
 }
 
-void IndexPipeline::GraphTask(KNN_Queue &knn_queue)
-{
-    auto max_degree = parameters_.Get<uint32_t>("M_pjbp");
-    auto iso_thres = parameters_.Get<float>("iso_thres");
-    uint32_t *d_knn_idxs;
-    CUDA_CHECK(cudaMalloc(&d_knn_idxs, BATCH * k * sizeof(int)));
-    while (true)
-    {
-        // bool is_full;
-        CUDA_CHECK(cudaMemset(d_knn_idxs, -1, BATCH * k * sizeof(int)));
-        knn_queue.ReadHead(d_knn_idxs);
-        // {
-        //     std::unique_lock<std::mutex> lk(knn_mtx);
-        //     graph_cv.wait(lk, [&]{ return !knn_res.Empty(); });
-        //     is_full = knn_res.Full();
-        //     d_knn_idxs = knn_res.Use();
-        // }
-        // if (is_full) knn_cv.notify_one();
-
-        float iso_ratio = gpufuncs->handle_knn_updates(d_knn_idxs);
-        fo.print("Current isolated ratio = " + std::to_string(iso_ratio));
-        if (1 - iso_ratio >= iso_thres)
-        {
-            std::unique_lock<std::shared_mutex> lk(iso_mtx);
-            iso_flag = true;
-            fo.iprint("Isolated ratio below threshold, stopping.");
-            break;
-        }
-    }
-}
-
 void IndexPipeline::KNNTask(KNN_Queue &knn_queue, GTCache &cache)
 {
     uint32_t processed = 0;
     for (auto res : cache.results)
     {
-        knn_queue.WriteTail(res.knn.data(), KNNType::host);
+        knn_queue.WriteTail(res.knn.data(), res.batch, KNNType::host);
         processed += BATCH;
     }
-    for (; processed < u32_nd_sq_;)
+    while (processed < u32_nd_sq_)
     {
         {
-            std::shared_lock<std::shared_mutex> lk(iso_mtx);
-            if (iso_flag)
+            std::shared_lock<std::shared_mutex> lk(mtx);
+            if (stop_flag)
                 break;
         }
         fo.print("Processed: " + std::to_string(processed) + "/" + std::to_string(u32_nd_sq_));
@@ -197,10 +145,103 @@ void IndexPipeline::KNNTask(KNN_Queue &knn_queue, GTCache &cache)
         // 计算 batch 查询的 knn
         float time_ms;
         uint32_t *d_knn = gpufuncs->knn_compute(h_queries + processed * dimension_, batch, time_ms);
-        cache.WriteCache(d_knn, time_ms);
-        knn_queue.WriteTail(d_knn, KNNType::device);
+        cache.WriteCache(d_knn, batch, time_ms);
+        knn_queue.WriteTail(d_knn, batch, KNNType::device);
 
         processed += batch;
+    }
+}
+
+void IndexPipeline::GraphTask(KNN_Queue &knn_queue)
+{
+    auto max_degree = parameters_.Get<uint32_t>("M_pjbp");
+
+    std::thread worker(&IndexPipeline::update_graph, this);
+
+    uint32_t *d_knn_idxs;
+    CUDA_CHECK(cudaMalloc(&d_knn_idxs, BATCH * k * sizeof(int)));
+    while (true)
+    {
+        {
+            std::shared_lock<std::shared_mutex> lk(mtx);
+            if (stop_flag)
+                break;
+        }
+        CUDA_CHECK(cudaMemset(d_knn_idxs, -1, BATCH * k * sizeof(int)));
+        const int batch = knn_queue.ReadHead(d_knn_idxs);
+
+        uint32_t *d_new_nbr_ids = gpufuncs->handle_knn_updates(d_knn_idxs, batch);
+        Graph_Update_Info gui(d_knn_idxs, d_new_nbr_ids, k, batch, max_degree);
+        {
+            std::unique_lock<std::shared_mutex> lock(mtx);
+            graph_update_queue.push(std::move(gui));
+        }
+        cv.notify_one();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(mtx);
+        stop_flag = true;
+    }
+    cv.notify_one();
+
+    if (worker.joinable())
+        worker.join();
+
+    CUDA_CHECK(cudaFree(d_knn_idxs));
+}
+
+void IndexPipeline::update_graph()
+{
+    static int nonisolated_num = 0;
+    auto iso_thres = parameters_.Get<float>("iso_thres");
+    auto max_degree = parameters_.Get<uint32_t>("M_pjbp");
+    while (true)
+    {
+        Graph_Update_Info gui;
+        {
+            std::unique_lock<std::shared_mutex> lock(mtx);
+            cv.wait(lock, [this]
+                    { return !graph_update_queue.empty() || stop_flag; });
+
+            if (stop_flag && graph_update_queue.empty())
+                break;
+
+            if (graph_update_queue.empty())
+                continue;
+
+            gui = std::move(graph_update_queue.front());
+            graph_update_queue.pop();
+        }
+
+        for (int i = 0; i < gui.batch * k; i++)
+        {
+            const uint32_t pivot_id = gui.knn_ids[i];
+            if (projection_graph_[pivot_id].size() == 0)
+            {
+                nonisolated_num++;
+                projection_graph_[pivot_id].resize(max_degree);
+            }
+            memcpy(
+                projection_graph_[pivot_id].data(),
+                gui.new_nbr_ids.get() + i * max_degree,
+                max_degree * sizeof(uint32_t));
+            projection_graph_[pivot_id].erase(
+                std::remove(
+                    projection_graph_[pivot_id].begin(),
+                    projection_graph_[pivot_id].end(),
+                    -1),
+                projection_graph_[pivot_id].end());
+        }
+
+        float iso_ratio = 100 * (float)nonisolated_num / (float)u32_nd_;
+        fo.iprint("Graph updated with isolated ratio = " + std::to_string(iso_ratio) + "%");
+        if (iso_ratio >= iso_thres)
+        {
+            std::unique_lock<std::shared_mutex> lock(mtx);
+            stop_flag = true;
+            fo.iprint("Isolated ratio below threshold, stopping.");
+            return;
+        }
     }
 }
 
@@ -275,7 +316,7 @@ void IndexPipeline::ProjectionReserveSpace()
     projection_graph_.resize(u32_nd_);
     for (uint32_t i = 0; i < u32_nd_; ++i)
     {
-        projection_graph_[i].reserve(M_pjbp * PROJECTION_SLACK);
+        projection_graph_[i].reserve(M_pjbp);
     }
 }
 

@@ -4,7 +4,7 @@ CE=0
 prefix=../data/t2i-10M
 topk=100
 num_threads=16
-date=0710
+date=0716
 iso_thres=0.9
 recall=0.98
 
@@ -12,11 +12,6 @@ cd ~/pro/PIPEGPU
 rm -r build
 mkdir build
 cd build
-export CC=/usr/bin/gcc-9
-export CXX=/usr/bin/g++-9
-export CUDAHOSTCXX=/usr/bin/g++-9
-export CUDACXX=/usr/local/cuda-11.4/bin/nvcc
-export CUDAToolkit_ROOT=/usr/local/cuda-11.4
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_BUILD_TYPE=Debug -Wno-dev 
 # cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_BUILD_TYPE=Debug -DCUDAToolkit_ROOT=/usr/local/cuda-11.4 -Wno-dev 
 make -j &> make.log

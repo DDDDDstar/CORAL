@@ -24,14 +24,11 @@ namespace efanna2e
 
 #define MAXK 128
 
-    class Stream
+    struct MyStream
     {
     public:
         cudaStream_t stream;
         cudaEvent_t start, stop;
-
-        Stream();
-        ~Stream();
     };
 
     struct Candidate_Neighbor
@@ -61,7 +58,7 @@ namespace efanna2e
         uint32_t *d_new_nbr_ids; // handle_knn_updates 的结果
 
         const std::string stream_names[2] = {"knn", "upd"};
-        std::unordered_map<std::string, Stream> streams;
+        std::unordered_map<std::string, MyStream> streams;
 
         int blocknum_per_query = 5;
 
