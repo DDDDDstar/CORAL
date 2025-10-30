@@ -1,405 +1,333 @@
-#include <thrust/sort.h>
-#include <thrust/device_ptr.h>
-#include <thrust/device_vector.h>
-#include <thrust/execution_policy.h>
+#include <curand_kernel.h>
+
 #include <cfloat>
-#include <utility>
 #include <iostream>
-#include <cmath>
-#include <cub/cub.cuh>
+#include <string>
+#include <utility>
 
-#include "knn.cuh"
-#include "fileout.h"
+#include "gpufuncs.cuh"
+#include "uni.h"
+#include "utils.cuh"
 
-using namespace efanna2e;
-using CN = Candidate_Neighbor;
+#define MAX_MSG_LEN 20
 
-bool cuda_check_last_error(const char *func_name)
-{
+namespace efanna2e {
+// using CN = Candidate_Neighbor;
+
+bool cuda_check_last_error(std::string func_name) {
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        std::cerr << "Kernel error in " << func_name << ": " << cudaGetErrorString(err) << std::endl;
+    if (err != cudaSuccess) {
+        fo.eprint("Kernel error in " + func_name + ": " + cudaGetErrorString(err));
         return true;
     }
     return false;
 }
 
-// ----------- 欧式距离平方计算 -----------
-__device__ float l2_distance(const float *a, const float *b, int dim)
-{
-    float dist = 0.0f;
-    for (int i = 0; i < dim; ++i)
-    {
-        float diff = a[i] - b[i];
-        dist += diff * diff;
-    }
-    return dist;
-}
+__global__ void compute_knn_dist_kernel(const float* __restrict__ d_q,
+                                        const float* __restrict__ d_b, float* dists, int* idxs,
+                                        int batch, BP bp) {
+    const int qid = blockIdx.x % batch, bid = blockIdx.x / batch, tid = threadIdx.x;
+    const int threads = blockDim.x, total_blocks = gridDim.x;
 
-__device__ float l2_distance_runtime_load(
-    const float *a, const float *b_base, uint32_t b_index, int dim)
-{
-    float dist = 0.0f;
-    for (int i = 0; i < dim; ++i)
-    {
-        float diff = a[i] - b_base[b_index * dim + i];
-        dist += diff * diff;
-    }
-    return dist;
-}
-
-__global__ void compute_knn_candidates(
-    const float *__restrict__ d_q, // 查询向量
-    const float *__restrict__ d_b, // 基础向量库
-    float *dists,                  // 输出：所有距离（每个查询占 base_n 个）
-    uint32_t *idxs,                // 输出：所有索引（与距离一一对应）
-    int batch, int base_n, int dim)
-{
-    int qid = blockIdx.x % batch; // 当前处理的查询向量编号
-    int bid = blockIdx.x / batch;
-    int tid = threadIdx.x, threads = blockDim.x;
-    int total_blocks = gridDim.x;
-    // 使用 shared memory 缓存当前查询向量，提高访存效率
-    extern __shared__ float query_vec[];
-    if (bid == 0 && tid < dim)
-        query_vec[tid] = d_q[qid * dim + tid];
+    extern __shared__ float query_vec[];  // 使用 shared memory 缓存当前查询向量，提高访存效率
+    if (tid < bp.dim) query_vec[tid] = __ldg(&d_q[qid * bp.dim + tid]);
     __syncthreads();
+
     // 每个线程负责计算部分 base_n 向量的距离
-    for (int i = bid * threads + tid; i < base_n; i += threads * total_blocks / batch)
-    {
-        float dist = l2_distance(query_vec, &d_b[i * dim], dim);
-        dists[qid * base_n + i] = dist;
-        idxs[qid * base_n + i] = i;
+    for (int i = bid * threads + tid; i < bp.base_n; i += threads * total_blocks / batch) {
+        const float* base_vec = d_b + i * bp.dim;  // 当前基础向量
+        dists[qid * bp.base_n + i] = bp.metric == DIST_METRIC::L2
+                                         ? l2_distance(query_vec, base_vec, bp.dim)
+                                         : ip_distance(query_vec, base_vec, bp.dim);
+        idxs[qid * bp.base_n + i] = i;
     }
 }
 
-__global__ void knn_dist_compute_kernel(
-    const float *__restrict__ base, int base_n,
-    const uint32_t *__restrict__ knns, // 查询的 knn 结果 batch * k
-    CN *cand_nbrs,                     // 存储结果：K 个向量两两之间距离（batch*K*K 矩阵）
-    const int tile_k, const int K, const int dim)
-{
-    const int group_id = blockIdx.x; // 当前处理的一组 KNN 的编号
-    const int tid = threadIdx.x, threads_per_block = blockDim.x;
-    // 首先计算一组 KNN 中所有基础向量之间的距离
-    extern __shared__ float tile_vecs[]; // 存储一个 tile 的基础向量，大小为 tile_k * dim
+__device__ void insert_topk(float* heap_vals, int* heap_idxs, float val, int idx, int k) {
+    // Find max in heap and replace if necessary
+    int max_idx = 0;
+    for (int i = 1; i < k; ++i)
+        if (heap_vals[i] > heap_vals[max_idx]) max_idx = i;
+    if (val < heap_vals[max_idx]) {
+        heap_vals[max_idx] = val;
+        heap_idxs[max_idx] = idx;
+    }
+}
 
-    for (int row_tile = 0; row_tile < K; row_tile += tile_k)
-    {
-        // 加载 tile_k 个 row 向量进共享内存
-        for (int i = tid; i < tile_k * dim; i += threads_per_block)
-        {
-            const int vec_idx = i / dim; // tile 中第 vec_idx 个向量
-            const int dim_idx = i % dim;
-            const int global_idx = row_tile + vec_idx;
-            if (global_idx < K)
-            {
-                const uint32_t base_idx = knns[group_id * K + global_idx];
-                tile_vecs[i] = base[base_idx * dim + dim_idx];
-            }
-        }
-        __syncthreads();
-
-        for (int col_tile = 0; col_tile < K; col_tile += tile_k)
-        {
-            for (int i = tid; i < tile_k * tile_k; i += threads_per_block)
-            {
-                const int local_row = i / tile_k, local_col = i % tile_k;
-                const int global_row = row_tile + local_row;
-                const int global_col = col_tile + local_col;
-                if (global_row < K && global_col < K)
-                {
-                    const uint32_t col_base_idx = knns[group_id * K + global_col];
-                    const float *tile_row_vec = &tile_vecs[local_row * dim];
-                    const int matrix_idx = group_id * K * K + global_row * K + global_col;
-                    cand_nbrs[matrix_idx].dist = l2_distance_runtime_load(
-                        tile_row_vec, base, col_base_idx, dim);
-                    cand_nbrs[matrix_idx].idx = global_col;
-                    cand_nbrs[matrix_idx].id = col_base_idx;
-                }
-            }
-            __syncthreads(); // 等待所有线程完成当前 tile 的计算
+__global__ void topk_copy_kernel(int* d_knn_res, const int* d_all_idx, int batch, BP bp) {
+    // 每个 block 处理一个 KNN 结果拷贝
+    for (int qidx = blockIdx.x; qidx < batch; qidx += gridDim.x) {
+        const int src_offset = qidx * bp.base_n, dst_offset = qidx * bp.k;
+        for (int i = threadIdx.x; i < bp.k; i += blockDim.x) {
+            const int idx = bp.metric == DIST_METRIC::L2 ? i : bp.base_n - 1 - i;
+            d_knn_res[dst_offset + i] = d_all_idx[src_offset + idx];
         }
     }
 }
 
-__device__ CN &get_CN(
-    CN *cand_nbrs, const uint8_t *sort_idxs,
-    const uint8_t i, const int batch_id, const int pivot_idx, const int k)
-{
-    const uint8_t idx = sort_idxs[batch_id * k * k + pivot_idx * k + i];
-    return cand_nbrs[batch_id * k * k + pivot_idx * k + idx];
-}
-
-// wait_to_ignore = wti
-__global__ void candidate_ignore_kernel(
-    CN *cand_nbrs,           // 每个批次的所有 KNN 中每个 pivot 的候选邻居向量到 pivot 的距离等信息，大小：batch * k * k
-    uint8_t *sort_idxs,      // 每个批次的 KKN 中向量每个 pivot 的候选邻居向量根据到 pivot 的距离排序后的原索引（0~k-1），大小：batch * k * k
-    uint8_t *nbr_num,        // 记录当前每个 pivot 的邻居数量，大小：batch * k
-    const uint8_t new_nbr_i, // 1 <= new_nbr_i <= k - 1
-    const int batch, const int k, const int max_degree)
-{
-    const int batch_id = blockIdx.x, tid = threadIdx.x, threads_per_block = blockDim.x;
-    const int wti_num = k - new_nbr_i - 1;
-    for (int i = tid; i < k * wti_num; i += threads_per_block)
-    {
-        const uint8_t pivot_idx = i / wti_num;
-        if (nbr_num[batch_id * k + pivot_idx] >= max_degree)
-            continue;
-        CN &cand_nbr = get_CN(cand_nbrs, sort_idxs, new_nbr_i, batch_id, pivot_idx, k); // pivot 的第 new_nbr_i 个候选邻居（排序后）
-
-        if (!cand_nbr.status) // 若新候选邻居状态为待定（未淘汰）
-        {
-            cand_nbr.status = 1;                 // 成为 pivot 的新邻居
-            nbr_num[batch_id * k + pivot_idx]++; // pivot 的邻居数量加一
-
-            CN &wti_cand_nbr = get_CN(cand_nbrs, sort_idxs, i % wti_num + new_nbr_i + 1, batch_id, pivot_idx, k); // 待淘汰候选邻居
-
-            if (!wti_cand_nbr.status) // 若待淘汰邻居状态为待定（未淘汰）
-            {
-                const float ignore_pivot_dist = wti_cand_nbr.dist;                                                        // 待淘汰候选邻居到 pivot 的距离
-                const float new_nbr_ignore_dist = cand_nbrs[batch_id * k * k + cand_nbr.idx * k + wti_cand_nbr.idx].dist; // new_nbr 和 wti 之间的距离
-                if (ignore_pivot_dist >= new_nbr_ignore_dist)
-                    wti_cand_nbr.status = 2; // 淘汰
-            }
+__global__ void topk_copy_kernel(int* d_knn_res, const int* d_all_idx, float* d_dist_res,
+                                 const float* d_all_dist, int batch, BP bp) {
+    // 每个 block 处理一个 KNN 结果拷贝
+    for (int qidx = blockIdx.x; qidx < batch; qidx += gridDim.x) {
+        const int src_offset = qidx * bp.base_n, dst_offset = qidx * bp.k;
+        for (int i = threadIdx.x; i < bp.k; i += blockDim.x) {
+            // ip 越大，距离越近
+            const int idx = bp.metric == DIST_METRIC::L2 ? i : bp.base_n - 1 - i;
+            d_knn_res[dst_offset + i] = d_all_idx[src_offset + idx];
+            d_dist_res[dst_offset + i] = d_all_dist[src_offset + idx];
         }
     }
 }
 
-// 根据 candidate_ignore_kernel 的结果（d_cand_nbrs）提取每个批次的 KNN 中每个 pivot 的邻居 base_id
-// 结果存在 new_nbrs 中，大小：batch * k * max_degree
-__global__ void get_new_nbrs_kernel(
-    CN *cand_nbrs, uint32_t *new_nbr_ids, const int k, const int max_degree)
-{
-    const int batch_id = blockIdx.x, tid = threadIdx.x, threads_per_block = blockDim.x;
-    for (int i = tid; i < k; i += threads_per_block)
-    {
-        uint32_t nbr_num = 0;
-        for (int j = 0; j < k && nbr_num < max_degree; j++)
-        {
-            CN &cand_nbr = cand_nbrs[batch_id * k * k + i * k + j];
-            if (cand_nbr.status == 1)
-                new_nbr_ids[batch_id * k * max_degree + i * max_degree + nbr_num++] = cand_nbr.id;
+__global__ void base_query_update_kernel(const int* __restrict__ knns,
+                                         const float* __restrict__ all_dists_sort,
+                                         int* __restrict__ base_query_ids,
+                                         float* __restrict__ base_query_dists, int start_qid,
+                                         int batch, BP bp) {
+    const int bid = blockIdx.x, tid = threadIdx.x, tpb = blockDim.x;
+    for (int qidx = bid; qidx < batch; qidx += gridDim.x) {
+        for (int i = tid; i < bp.k; i += tpb) {
+            const int knn_idx = qidx * bp.k + i, base_id = knns[knn_idx];
+            const float dist = all_dists_sort[qidx * bp.base_n + i];
+            // 原子比较更新最近距离和索引:
+            atomicClosestFloat(base_query_dists + base_id, dist, bp);
+            __threadfence();  // 刷写全局/共享内存，使其他 block 可见
+            if (base_query_dists[base_id] - dist < EPS) base_query_ids[base_id] = start_qid + qidx;
         }
     }
 }
 
-// CUDA kernel: 生成 CUB 段排序所需 offsets 数组（每 batch * k 个长度为 k 的段）
-__global__ void generate_segment_offsets(uint32_t *offsets, const int batch, const int k)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx <= batch * k)
-        offsets[idx] = idx * k;
-}
-
-uint32_t *GPUFuncs::knn_compute(const float *h_queries, const int batch, float &time_ms)
-{
+int* GPUFuncs::knn_compute(int batch, int start_id, float& time_ms) {
     const std::string name = "knn";
-    cudaStream_t &stream = streams[name].stream;
-    float *d_all_dist; // 存储所有查询的距离与索引结果，用于之后排序
-    uint32_t *d_all_idx;
-    int blocks = batch * blocknum_per_query;
-    int threads = 1024; // must > K
+    cudaStream_t& stream = streams[name].stream;
+
     event_record_time_start(name);
-    // 传输 batch 查询
-    CUDA_CHECK(cudaMemcpyAsync(
-        d_q, h_queries, batch * dim * sizeof(float), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMallocAsync(&d_all_dist, batch * base_n * sizeof(float), stream));
-    CUDA_CHECK(cudaMallocAsync(&d_all_idx, batch * base_n * sizeof(uint32_t), stream));
-    compute_knn_candidates<<<blocks, threads, dim * sizeof(float), stream>>>(
-        d_q, d_b, d_all_dist, d_all_idx, batch, base_n, dim);
-    time_ms = event_record_time_stop(name, "dist_compute");
-    // 对每个查询结果进行排序，提取 top-K（使用 thrust 排序）
+
+    compute_knn_dist_kernel<<<batch * blocknum_per_query, knn_threads, bp.dim * sizeof(float),
+                              stream>>>(d_q + start_id * bp.dim, d_b.data().get(), d_all_dist,
+                                        d_all_idx, batch, bp);
+
+    time_ms = event_record_time_stop(name, "knn_dist_compute");
+    // 对每个查询结果进行排序，提取 top-K
     event_record_time_start(name);
-    cudaMemsetAsync(d_knn_res, -1, batch * k * sizeof(int), stream);
-    for (int qid = 0; qid < batch; ++qid)
+
+    auto res = segmented_sort_pairs(d_all_idx, d_all_dist, d_all_idx_sort, d_all_dist_sort,
+                                    d_topk_offsets, stream, batch, bp.base_n);
+    topk_copy_kernel<<<batch, 64, 0, stream>>>(d_knn_res, res.first, batch, bp);
+    query_knns.record(start_id, d_knn_res, batch, stream);
+
     {
-        thrust::device_ptr<float> dist_ptr(d_all_dist + qid * base_n);
-        thrust::device_ptr<uint32_t> idx_ptr(d_all_idx + qid * base_n);
-        // 对当前查询向量对应的 base_n 距离和索引进行排序
-        thrust::sort_by_key(
-            thrust::cuda::par.on(stream), dist_ptr, dist_ptr + base_n, idx_ptr);
-        // 仅拷贝前 k 个最小距离对应的索引作为输出
-        CUDA_CHECK(cudaMemcpyAsync(
-            d_knn_res + qid * k, d_all_idx + qid * base_n, k * sizeof(int),
-            cudaMemcpyDeviceToDevice, stream));
+        std::unique_lock<std::shared_mutex> lock(base_query_mtx);
+        base_query_update_kernel<<<batch, 64, 0, stream>>>(d_knn_res, res.second, base_query_ids,
+                                                           base_query_dists, start_id, batch, bp);
     }
     time_ms += event_record_time_stop(name, "knn_sort_compute");
-    CUDA_CHECK(cudaFreeAsync(d_all_dist, stream));
-    CUDA_CHECK(cudaFreeAsync(d_all_idx, stream));
+
     return d_knn_res;
 }
 
-struct ExtractDist
-{
-    __host__ __device__ float operator()(const CN &nbr) const
-    {
-        return nbr.dist;
-    }
-};
+int* GPUFuncs::knn_compute(const float* h_queries, int batch, float& time_ms) {
+    const std::string name = "knn";
+    cudaStream_t& stream = streams[name].stream;
 
-struct ExtractIdx
-{
-    __host__ __device__ float operator()(const CN &nbr) const
-    {
-        return nbr.idx;
-    }
-};
-
-uint32_t *GPUFuncs::handle_knn_updates(const uint32_t *d_knn_idxs, const int batch)
-{
-    const std::string name = "upd";
-    cudaStream_t &stream = streams[name].stream;
-
-    const size_t max_vec_num = shared_mem_per_block / sizeof(float) / dim; // 共享内存最大向量存储数量
-    const size_t tile_k = k / ((k + max_vec_num - 1) / max_vec_num);       // 每个 block 根据共享内存大小限制分块处理对应的 KNN
-    const size_t shared_memsize = tile_k * dim * sizeof(float);            // 每个 block 的共享内存大小
-
-    // 1. 计算一个 batch 中每组 KNN 中基础向量两两间距
     event_record_time_start(name);
-    CN *d_cand_nbrs; // 每个批次的所有 KNN 中每个 pivot 的候选邻居向量信息，大小：batch * k * k
-    CUDA_CHECK(cudaMallocAsync(&d_cand_nbrs, batch * k * k * sizeof(CN), stream));
-    knn_dist_compute_kernel<<<batch, 256, shared_memsize, stream>>>(
-        d_b, base_n, d_knn_idxs, d_cand_nbrs, tile_k, k, dim);
-    event_record_time_stop(name, "knn_dist_compute");
 
-    // 2.1. 针对每组 KNN 中每个 pivot 节点，对候选向量集（其他 k-1 个向量）按到 pivot 的距离排序
-    // 初始距离和排序后距离都存储在作为上一步结果的 d_knn_dists（batch*k*k 的矩阵）中
+    thrust::device_vector<float> queries(batch * bp.dim);
+    CUDA_CHECK(cudaMemcpyAsync(queries.data().get(), h_queries, batch * bp.dim * sizeof(float),
+                               cudaMemcpyHostToDevice, stream));
+    // thrust::copy(thrust::cuda::par.on(stream), h_queries, h_queries + batch * bp.dim,
+    //              queries.begin());
+
+    compute_knn_dist_kernel<<<batch * blocknum_per_query, knn_threads, bp.dim * sizeof(float),
+                              stream>>>(queries.data().get(), d_b.data().get(), d_all_dist,
+                                        d_all_idx, batch, bp);
+
+    time_ms = event_record_time_stop(name, "knn_dist_compute");
+    // 对每个查询结果进行排序，提取 top-K
     event_record_time_start(name);
-    float *d_knn_dists;
-    uint8_t *d_sort_idxs;
-    CUDA_CHECK(cudaMallocAsync(&d_knn_dists, batch * k * k * sizeof(float), stream));
-    CUDA_CHECK(cudaMallocAsync(&d_sort_idxs, batch * k * k * sizeof(uint8_t), stream));
-    thrust::device_ptr<CN> nbrs_ptr(d_cand_nbrs);
-    thrust::device_ptr<float> dists_ptr(d_knn_dists);
-    thrust::device_ptr<uint8_t> idxs_ptr(d_sort_idxs);
-    // 提取结构体数组 d_cand_nbrs 中的 dist 字段，拷贝到数组 d_knn_dists（即 batch * k * k 的距离）
-    thrust::transform(
-        thrust::cuda::par.on(stream),
-        nbrs_ptr, nbrs_ptr + batch * k * k, dists_ptr,
-        ExtractDist());
-    thrust::transform(
-        thrust::cuda::par.on(stream),
-        nbrs_ptr, nbrs_ptr + batch * k * k, d_sort_idxs,
-        ExtractIdx());
-    // 使用 cub::DeviceSegmentedSort 对 d_cand_nbrs 进行排序
-    float *d_knn_dists_sort;
-    CUDA_CHECK(cudaMallocAsync(&d_knn_dists_sort, batch * k * k * sizeof(float), stream));
-    uint32_t *d_offsets;
-    CUDA_CHECK(cudaMallocAsync(&d_offsets, (batch * k + 1) * sizeof(uint32_t), stream));
-    generate_segment_offsets<<<(batch * k + 255) / 256, 256, 0, stream>>>(d_offsets, batch, k);
-    void *d_temp_storage = nullptr;
-    size_t temp_storage_bytes = 0;
-    // 使用双缓冲模式
-    cub::DoubleBuffer<float> dists_buffer(d_knn_dists, d_knn_dists);
-    cub::DoubleBuffer<uint8_t> idxs_buffer(d_sort_idxs, d_sort_idxs);
-    cub::DeviceSegmentedSort::SortPairs(
-        d_temp_storage, temp_storage_bytes,
-        dists_buffer, idxs_buffer,
-        batch * k * k, batch * k, d_offsets, d_offsets + 1, stream);
-    CUDA_CHECK(cudaMallocAsync(&d_temp_storage, temp_storage_bytes, stream));
-    cub::DeviceSegmentedSort::SortPairs(
-        d_temp_storage, temp_storage_bytes,
-        dists_buffer, idxs_buffer,
-        batch * k * k, batch * k, d_offsets, d_offsets + 1, stream);
-    CUDA_CHECK(cudaFreeAsync(d_offsets, stream));
-    CUDA_CHECK(cudaFreeAsync(d_knn_dists, stream));
-    CUDA_CHECK(cudaFreeAsync(d_knn_dists_sort, stream));
-    CUDA_CHECK(cudaFreeAsync(d_temp_storage, stream));
-    event_record_time_stop(name, "knn_dist_sort");
 
-    // 2.2. 针对 batch 组 k 近邻数据，每次迭代线程并行进行 𝑏𝑎𝑡𝑐ℎ * 𝑘 * (𝑘 − 2 − 𝑖) 次淘汰
-    event_record_time_start(name);
-    uint8_t *d_nbr_num; // 每个 pivot 的邻居数量，大小：batch * k
-    CUDA_CHECK(cudaMallocAsync(&d_nbr_num, batch * k * sizeof(uint8_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(d_nbr_num, 0, batch * k * sizeof(uint8_t), stream));
-    // 根据每个 pivot 候选邻居到 pivot 的距离，从近到远成为邻居并并行淘汰后面的后续邻居
-    for (uint8_t i = 1; i < k; ++i)
-        candidate_ignore_kernel<<<batch, 256, 0, stream>>>(
-            d_cand_nbrs, d_sort_idxs, d_nbr_num, i, batch, k, max_degree);
+    auto res = segmented_sort_pairs(d_all_idx, d_all_dist, d_all_idx_sort, d_all_dist_sort,
+                                    d_topk_offsets, stream, batch, bp.base_n);
+    topk_copy_kernel<<<batch, 64, 0, stream>>>(d_knn_res, res.first, batch, bp);
 
-    CUDA_CHECK(cudaMemsetAsync(d_new_nbr_ids, -1, BATCH * k * max_degree * sizeof(uint32_t), stream));
-    get_new_nbrs_kernel<<<batch, k, 0, stream>>>(d_cand_nbrs, d_new_nbr_ids, k, max_degree);
-    CUDA_CHECK(cudaFreeAsync(d_nbr_num, stream));
-    CUDA_CHECK(cudaFreeAsync(d_cand_nbrs, stream));
-    event_record_time_stop(name, "candidate_ignore");
-
-    return d_new_nbr_ids;
+    time_ms += event_record_time_stop(name, "knn_sort_compute");
+    return d_knn_res;
 }
 
-GPUFuncs::GPUFuncs(
-    const float *h_base, int base_n, int dim, int k, int max_degree)
-    : base_n(base_n), dim(dim), k(k), max_degree(max_degree)
-{
+// GPU 内核：初始化随机状态
+__global__ void init_curand(curandState* states, unsigned long seed, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    curand_init(seed, idx, 0, &states[idx]);
+}
+
+// GPU 内核：生成 0~1 随机数
+__global__ void gen_uniform(curandState* states, float* out, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    out[idx] = curand_uniform(&states[idx]);
+}
+
+// GPU 内核：计算每个点到最近中心的平方距离（用于 KMeans++）
+__global__ void compute_min_dist(const float* __restrict__ data,
+                                 const float* __restrict__ centroids, float* min_dists, BP bp,
+                                 int num_centers) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bp.query_n) return;
+
+    float dist = INFINITY;
+    for (int k = 0; k < num_centers; k++) {
+        float d = calc_distance(data + idx * bp.dim, centroids + k * bp.dim, bp);
+        if (d < dist) dist = d;
+    }
+    min_dists[idx] = dist;
+}
+
+void GPUFuncs::knn_prepare(const float* h_base, const float* h_queries) {
+    cudaStream_t& stream = streams["knn"].stream;
+    // 基础向量数据和查询向量数据  GPU 内存分配和数据传输（host->device）
+    CUDA_CHECK(cudaMallocAsync(&d_q, bp.query_n * bp.dim * sizeof(float), stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_b.data().get(), h_base, bp.base_n * bp.dim * sizeof(float),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_q, h_queries, bp.query_n * bp.dim * sizeof(float),
+                               cudaMemcpyHostToDevice, stream));
+
+    CUDA_CHECK(cudaMallocAsync(&d_knn_res, BATCH * bp.k * sizeof(int), stream));
+
+    // knn_compute 预分配内存
+    CUDA_CHECK(cudaMallocAsync(&d_all_dist, BATCH * bp.base_n * sizeof(float), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_all_dist_sort, BATCH * bp.base_n * sizeof(float), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_all_idx, BATCH * bp.base_n * sizeof(int), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_all_idx_sort, BATCH * bp.base_n * sizeof(int), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_topk_offsets, (BATCH + 1) * sizeof(int), stream));
+
+    CUDA_CHECK(cudaMallocAsync(&base_query_ids, bp.base_n * sizeof(int), stream));
+    CUDA_CHECK(cudaMallocAsync(&base_query_dists, bp.base_n * sizeof(float), stream));
+    thrust::device_ptr<int> base_query_ids_ptr(base_query_ids);
+    thrust::device_ptr<float> base_query_dists_ptr(base_query_dists);
+    thrust::fill(thrust::cuda::par.on(stream), base_query_ids_ptr, base_query_ids_ptr + bp.base_n,
+                 -1);
+    thrust::fill(thrust::cuda::par.on(stream), base_query_dists_ptr,
+                 base_query_dists_ptr + bp.base_n, farthest_dist(bp));
+}
+void GPUFuncs::knn_free() {
+    cudaStream_t& stream = streams["knn"].stream;
+    CUDA_CHECK(cudaFreeAsync(d_q, stream));
+    CUDA_CHECK(cudaFreeAsync(d_knn_res, stream));
+    CUDA_CHECK(cudaFreeAsync(d_all_dist, stream));
+    CUDA_CHECK(cudaFreeAsync(d_all_idx, stream));
+    CUDA_CHECK(cudaFreeAsync(d_topk_offsets, stream));
+    CUDA_CHECK(cudaFreeAsync(d_all_dist_sort, stream));
+    CUDA_CHECK(cudaFreeAsync(d_all_idx_sort, stream));
+    CUDA_CHECK(cudaFreeAsync(base_query_ids, stream));
+    CUDA_CHECK(cudaFreeAsync(base_query_dists, stream));
+}
+
+GPUFuncs::GPUFuncs(const float* h_base, float* h_queries, int base_n, int query_n, int dim, int k,
+                   int max_degree, DIST_METRIC m, int beam_capacity)
+    : bp(dim, max_degree, base_n, query_n, k, beam_capacity, m),
+      query_knns(100000, bp),
+      graph(bp.base_n * bp.max_degree, -1),
+      graph_deg(bp.base_n, 0),
+      graph_dist(bp.base_n * bp.max_degree),
+      d_b(bp.base_n * bp.dim) {
     cudaDeviceProp prop;
-    // 获取 GPU 设备
-    cudaGetDeviceProperties(&prop, 0);
-    shared_mem_per_block = prop.sharedMemPerBlock; // GPU 最大共享内存大小
-
-    fo.print("Compute Capability: " + std::to_string(prop.major) + " " + std::to_string(prop.minor));
+    cudaGetDeviceProperties(&prop, 0);              // 获取 GPU 设备
+    shared_mem_per_block = prop.sharedMemPerBlock;  // GPU 最大共享内存大小
+    fo.print("Compute Capability: " + std::to_string(prop.major) + " " +
+             std::to_string(prop.minor));
     fo.print("Max shared memory per block: " + std::to_string(shared_mem_per_block) + " bytes");
-    fo.print("Max shared memory per multiprocessor: " + std::to_string(prop.sharedMemPerMultiprocessor) + " bytes");
-
+    fo.print("Max shared memory permultiprocessor: " +
+             std::to_string(prop.sharedMemPerMultiprocessor) + " bytes");
     if (!prop.deviceOverlap)
         fo.eprint("Device does not support overlap, multi-stream may not improve performance.");
     else
         fo.print("Device supports overlap, multi-stream may improve performance.");
 
-    for (auto name : stream_names)
-    {
+    for (auto name : stream_names) {
         streams.emplace(name, MyStream());
         CUDA_CHECK(cudaStreamCreate(&streams[name].stream));
         CUDA_CHECK(cudaEventCreate(&streams[name].start));
         CUDA_CHECK(cudaEventCreate(&streams[name].stop));
     }
-
-    // 基础向量数据 GPU 内存分配和数据传输（host->device）
-    CUDA_CHECK(cudaMallocAsync(&d_b, base_n * dim * sizeof(float), streams["knn"].stream));
-    CUDA_CHECK(cudaMemcpyAsync(
-        d_b, h_base, base_n * dim * sizeof(float), // 字节数
-        cudaMemcpyHostToDevice, streams["knn"].stream));
-    // 查询向量数据（一个 batch） GPU 内存分配
-    CUDA_CHECK(cudaMallocAsync(&d_q, BATCH * dim * sizeof(float), streams["knn"].stream));
-
-    CUDA_CHECK(cudaMallocAsync(&d_knn_res, BATCH * k * sizeof(uint32_t), streams["knn"].stream));
-
-    CUDA_CHECK(cudaMallocAsync(&d_new_nbr_ids, BATCH * k * max_degree * sizeof(uint32_t), streams["upd"].stream));
+    query_data_kmeans(h_queries);
+    knn_prepare(h_base, h_queries);  // knn 预分配内存
+    upd_prepare();                   // upd 预分配内存
+    search_prepare();                // search 预分配内存
+    fo.iprint(bp.str());
 }
 
-GPUFuncs::~GPUFuncs()
-{
-    CUDA_CHECK(cudaFreeAsync(d_q, streams["knn"].stream));
-    CUDA_CHECK(cudaFreeAsync(d_b, streams["knn"].stream));
-    CUDA_CHECK(cudaFreeAsync(d_knn_res, streams["knn"].stream));
-
-    for (auto &pair : streams)
-    {
+GPUFuncs::~GPUFuncs() {
+    knn_free();
+    upd_free();
+    search_free();
+    for (auto& pair : streams) {
         CUDA_CHECK(cudaStreamDestroy(pair.second.stream));
         CUDA_CHECK(cudaEventDestroy(pair.second.start));
         CUDA_CHECK(cudaEventDestroy(pair.second.stop));
     }
 }
 
-void GPUFuncs::event_record_time_start(const std::string name)
-{
-    cudaEventRecord(streams[name].start, streams[name].stream); // 在流中记录开始事件
+void GPUFuncs::event_record_time_start(const std::string name) {
+    cudaEventRecord(streams[name].start, streams[name].stream);  // 在流中记录开始事件
 }
 
-float GPUFuncs::event_record_time_stop(const std::string name, std::string msg)
-{
-    if (cuda_check_last_error(msg.c_str()))
-        exit(EXIT_FAILURE);
-    float milliseconds = 0;
-    cudaEvent_t &start = streams[name].start, &stop = streams[name].stop;
-    // 在流中记录结束事件
-    cudaEventRecord(stop, streams[name].stream);
-    // 阻塞主机直到stop事件完成
-    cudaEventSynchronize(stop);
-    // 记录开始到结束的时间
-    cudaEventElapsedTime(&milliseconds, start, stop);
+float GPUFuncs::event_record_time_stop(const std::string stream_name, std::string func_name) {
+    if (cuda_check_last_error(func_name)) exit(EXIT_FAILURE);
 
-    fo.print(msg + "任务耗时: " + std::to_string(milliseconds / 1000) + " s");
+    float milliseconds = 0;
+    cudaEvent_t& stop = streams[stream_name].stop;
+    cudaEventRecord(stop, streams[stream_name].stream);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, streams[stream_name].start, stop);
+
+    record_time(func_name, milliseconds / 1000);
 
     return milliseconds;
 }
+
+void GPUFuncs::record_time(const std::string func_name, float time_s) {
+    if (!avg_times.contains(func_name)) avg_times[func_name] = Avg_Time();
+    avg_times[func_name].add(time_s);
+}
+
+void GPUFuncs::print_times() {
+    std::vector<std::pair<std::string, Avg_Time>> avg_times_vec(avg_times.begin(),
+                                                                avg_times.end());
+    std::sort(avg_times_vec.begin(), avg_times_vec.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+    std::string s;
+    for (auto& pair : avg_times_vec) {
+        const std::string& func = pair.first;
+        s += (func.size() >= MAX_MSG_LEN ? func
+                                         : func + std::string(MAX_MSG_LEN - func.size(), ' ')) +
+             " 任务平均耗时: " + std::to_string(pair.second.get()) +
+             " s; 总耗时: " + std::to_string(pair.second.get_total()) + " s\n";
+    }
+    fo.iprint(s);
+}
+
+int GPUFuncs::get_free_bytes() {
+    size_t free_bytes, total_bytes;                                  // 总显存
+    cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);  // 获取当前设备的显存信息
+
+    std::string func = "get_free_bytes";
+    if (status != cudaSuccess) fo.eprint(func + " Error: " + cudaGetErrorString(status));
+
+    // std::cout << "Total GPU memory: " << (total_bytes / (1024.0 * 1024.0)) << " MB" <<
+    // std::endl; std::cout << "Free GPU memory:  " << (free_bytes / (1024.0 * 1024.0)) << " MB" <<
+
+    return free_bytes;
+}
+
+Query_KNNs::Query_KNNs(int size, BP bp) : size(size), knns(size * bp.k), bp(bp) {}
+
+void Query_KNNs::record(int qid, int* new_knns, int batch, cudaStream_t& stream) {
+    if (qid >= size) {
+        size *= 2;
+        knns.resize(size);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(knns.data().get() + qid * bp.k, new_knns,
+                               batch * bp.k * sizeof(int), cudaMemcpyDeviceToDevice, stream));
+}
+}  // namespace efanna2e

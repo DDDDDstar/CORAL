@@ -1,7 +1,11 @@
 #include <future>
 #include <filesystem>
+#include <cassert>
 
 #include "fileout.h"
+
+#define SOLID_SQUARE "■"
+#define HOLLOW_SQUARE "□"
 
 namespace efanna2e
 {
@@ -78,9 +82,9 @@ namespace efanna2e
     void FileOut::iprint(std::string msg)
     {
         std::string decorated_msg =
-            "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n" +
+            "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n" +
             msg + "\n" +
-            ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>";
+            ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>";
 
         {
             std::lock_guard<std::mutex> lock(mtx);
@@ -107,7 +111,11 @@ namespace efanna2e
     void FileOut::qprint(
         const int head, const int tail, const int len, const int r, const int w)
     {
-        std::string queue_state = "KNN QUEUE: [ ";
+        assert(r < len && w < len);
+
+        std::string type = r == -1 ? "write" : "read ";
+        std::string queue_state = "KNN QUEUE " + type + " : [ ";
+
         for (int i = 0; i < len; ++i)
         {
             if (i == r)
@@ -115,23 +123,16 @@ namespace efanna2e
             else if (i == w)
                 queue_state += "*";
             else if (head == tail)
-                queue_state += "_";
+                queue_state += r == -1 ? HOLLOW_SQUARE : SOLID_SQUARE;
             else if (head < tail)
-            {
-                if (i < head || i >= tail)
-                    queue_state += "_";
-                else
-                    queue_state += std::to_string(i);
-            }
-            else
-            {
-                if (i < head && i >= tail)
-                    queue_state += "_";
-                else
-                    queue_state += std::to_string(i);
-            }
+                queue_state += i < head || i >= tail ? HOLLOW_SQUARE : SOLID_SQUARE;
+            else if (head > tail)
+                queue_state += i < head && i >= tail ? HOLLOW_SQUARE : SOLID_SQUARE;
         }
         queue_state += " ]";
+        // queue_state += " ] head: " + std::to_string(head) + " tail: " +
+        //                std::to_string(tail) + " r: " + std::to_string(r) +
+        //                " w: " + std::to_string(w);
 
         {
             std::lock_guard<std::mutex> lock(mtx);

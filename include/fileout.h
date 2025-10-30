@@ -8,6 +8,9 @@
 #include <future>
 #include <atomic>
 
+#ifndef FILEOUT_H
+#define FILEOUT_H
+
 namespace efanna2e
 {
 
@@ -22,6 +25,7 @@ namespace efanna2e
         void eprint(std::string msg); // error
         void qprint(                  // queue
             const int head, const int tail, const int len, const int r = -1, const int w = -1);
+        void sprint(std::string msg); // stream
 
     private:
         std::ofstream file_;
@@ -36,3 +40,5 @@ namespace efanna2e
 
     extern FileOut fo;
 }
+
+#endif // FILEOUT_H
