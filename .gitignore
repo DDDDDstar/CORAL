@@ -1,6 +1,6 @@
 build/
-data
+data/
 logs/
-gts
-indexes
-thirdparty
+gts/
+indexes/
+thirdparty/
