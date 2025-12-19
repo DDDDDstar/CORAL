@@ -1,0 +1,61 @@
+
+cmake_minimum_required(VERSION 3.18)
+
+file(GLOB_RECURSE CPP_SOURCES *.cpp)
+file(GLOB_RECURSE CUDA_SOURCES *.cu)
+
+# 查找BLAS库
+find_package(BLAS REQUIRED)
+message(STATUS "BLAS libraries: ${BLAS_LIBRARIES}")
+
+find_library(NVML_LIB 
+    NAMES nvidia-ml 
+    PATHS /usr/lib/x86_64-linux-gnu
+    REQUIRED)
+
+# 查找 LZ4（头文件 + 库）
+find_path(LZ4_INCLUDE_DIR lz4.h
+PATH_SUFFIXES lz4
+REQUIRED)
+find_library(LZ4_LIBRARY
+NAMES lz4
+REQUIRED)
+
+message(STATUS "LZ4 include dir: ${LZ4_INCLUDE_DIR}")
+message(STATUS "LZ4 lib: ${LZ4_LIBRARY}")
+
+
+
+add_library(${PROJECT_NAME} SHARED ${CPP_SOURCES} ${CUDA_SOURCES})
+
+include_directories(
+    ${LZ4_INCLUDE_DIR}
+)
+
+set_target_properties(${PROJECT_NAME} PROPERTIES
+  CUDA_ARCHITECTURES "80"
+  POSITION_INDEPENDENT_CODE ON
+)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    CUDAToolkit::cudart
+    faiss
+    faiss_gpu
+    ${BLAS_LIBRARIES} 
+    ${NVML_LIB}
+    ${LZ4_LIBRARY})
+    
+
+add_library(${PROJECT_NAME}_s STATIC ${CPP_SOURCES} ${CUDA_SOURCES})
+
+set_target_properties(${PROJECT_NAME}_s PROPERTIES
+  CUDA_ARCHITECTURES "80"
+  POSITION_INDEPENDENT_CODE ON
+)
+# target_link_libraries(${PROJECT_NAME}_s 
+#     ${BLAS_LIBRARIES} 
+#     ${CUDA_LIBRARIES} 
+#     ${NVML_LIB}
+#     ${LZ4_LIBRARY}
+#     faiss
+#     faiss_gpu)

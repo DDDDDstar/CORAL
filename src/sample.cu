@@ -31,52 +31,71 @@ std::vector<int> random_unique_numbers(int N, int K) {
     return std::vector<int>(nums.begin(), nums.begin() + K);  // 返回前 K 个数
 }
 
-__global__ void cluster_assign_kernel(const float *__restrict__ queries,
-                                      const int *__restrict__ centroid_ids,
-                                      int *__restrict__ labels,  // 输出: 每个样本的簇 ID
-                                      BP bp, int K, int n) {
+__global__ void centroid_init_kernel(const float* __restrict__ vecs, const int* __restrict__ idxs,
+                                     float* __restrict__ centroids, BP bp, int K) {
     const int block_num = gridDim.x, tpb = blockDim.x, bid = blockIdx.x, tid = threadIdx.x;
-    for (int id = bid * tpb + tid; id < n; id += block_num * tpb) {
-        const float *query = queries + id * bp.dim;
-        float min_dist = farthest_dist_d(bp);
-        int best_cid = -1;
-        for (int i = 0; i < K; ++i) {
-            const float dist = calc_distance(query, queries + centroid_ids[i] * bp.dim, bp);
-            if (compare_dist(min_dist, dist, bp)) {
-                min_dist = dist;
-                best_cid = i;
-            }
+    for (int cid = bid; cid < K; cid += block_num) {
+        const float* vec = vecs + idxs[cid] * bp.dim;
+        for (int d = tid; d < bp.dim; d += tpb) centroids[cid * bp.dim + d] = vec[d];
+    }
+}
+
+__global__ void cluster_assign_kernel(const float* __restrict__ queries,
+                                      const float* __restrict__ centroids,
+                                      int* __restrict__ labels,  // 输出: 每个样本的簇 ID
+                                      int* __restrict__ not_converge, BP bp, int K, int n) {
+    const int block_num = gridDim.x, tpb = blockDim.x, bid = blockIdx.x, tid = threadIdx.x;
+    extern __shared__ float s_query[];
+    float* s_dists = s_query + bp.dim;
+    int* s_min_labels = (int*)(s_dists + K);
+    for (int qid = bid; qid < n; qid += block_num) {
+        const float* query = queries + qid * bp.dim;
+        for (int d = tid; d < bp.dim; d += tpb) s_query[d] = query[d];
+        __syncthreads();
+
+        for (int i = tid; i < K; i += tpb) {
+            s_min_labels[i] = i;
+            s_dists[i] = calc_distance(s_query, centroids, i, bp);
         }
-        labels[id] = best_cid;
+        __syncthreads();
+
+        for (int offset = K / 2; offset > 0; offset >>= 1) {
+            for (int i = tid; i < offset; i += tpb)
+                if (compare_dist(s_dists[i], s_dists[i + offset], bp)) {
+                    s_dists[i] = s_dists[i + offset];
+                    s_min_labels[i] = s_min_labels[i + offset];
+                }
+            __syncthreads();
+        }
+
+        if (tid == 0 && labels[qid] != s_min_labels[0]) {
+            labels[qid] = s_min_labels[0];
+            if (not_converge != nullptr) *not_converge = 1;
+        }
     }
 }
 
 // kernel: 每个线程处理一个向量，把它加到对应的中心累加数组
-__global__ void compute_centroid_kernel(const float *__restrict__ queries,
-                                        const int *__restrict__ labels,
-                                        float *__restrict__ centers,
-                                        int *__restrict__ centroid_ids,
-                                        int *__restrict__ not_converge,
-                                        int *__restrict__ cluster_sizes, BP bp, int K, int sub_n) {
+__global__ void compute_centroid_kernel(const float* __restrict__ queries,
+                                        const int* __restrict__ labels,
+                                        float* __restrict__ vec_sums,
+                                        float* __restrict__ centroids, BP bp, int K, int sub_n) {
     const int block_num = gridDim.x, tpb = blockDim.x, bid = blockIdx.x, tid = threadIdx.x;
     extern __shared__ float sh_mem[];
-    float *sh_min_dtcs = sh_mem;
-    int *sh_min_ids = (int *)(sh_min_dtcs + tpb), *sh_cluster_size = sh_min_ids + tpb;
-
-    if (bid == 0 && tid == 0) *not_converge = 0;
+    float* sh_min_dtcs = sh_mem;
+    int *sh_min_ids = (int*)(sh_min_dtcs + tpb), *sh_cluster_size = sh_min_ids + tpb;
 
     for (int cluster_idx = bid; cluster_idx < K; cluster_idx += block_num) {
-        float *centers_start = centers + cluster_idx * tpb * bp.dim;
+        float* vec_sum = vec_sums + cluster_idx * tpb * bp.dim;
         sh_min_dtcs[tid] = farthest_dist_d(bp);
         if (tid == 0) *sh_cluster_size = 0;
         __syncthreads();
 
-        for (int d = 0; d < bp.dim; ++d) centers_start[tid * bp.dim + d] = 0.0f;  // 初始化
+        for (int d = 0; d < bp.dim; ++d) vec_sum[tid * bp.dim + d] = 0.0f;  // 初始化
         for (int i = tid; i < sub_n; i += tpb) {
             if (labels[i] != cluster_idx) continue;
             atomicAdd(sh_cluster_size, 1);
-            for (int d = 0; d < bp.dim; ++d)
-                centers_start[tid * bp.dim + d] += queries[i * bp.dim + d];
+            for (int d = 0; d < bp.dim; ++d) vec_sum[tid * bp.dim + d] += queries[i * bp.dim + d];
         }
         __syncthreads();
 
@@ -84,51 +103,49 @@ __global__ void compute_centroid_kernel(const float *__restrict__ queries,
         for (int offset = tpb / 2; offset > 0; offset >>= 1) {
             if (tid < offset)
                 for (int d = 0; d < bp.dim; ++d)
-                    centers_start[tid * bp.dim + d] += centers_start[(tid + offset) * bp.dim + d];
+                    vec_sum[tid * bp.dim + d] += vec_sum[(tid + offset) * bp.dim + d];
             __syncthreads();
         }
 
         for (int d = tid; d < bp.dim; d += tpb)  // 计算中心点平均值
-            centers_start[d] /= *sh_cluster_size;
+            // vec_sum[d] /= *sh_cluster_size;
+            centroids[cluster_idx * bp.dim + d] = vec_sum[d] / *sh_cluster_size;
         __syncthreads();
 
-        for (int i = tid; i < sub_n; i += tpb) {  // 计算 cluster 中每个向量和中心点的距离
-            if (labels[i] != cluster_idx) continue;
-            const float dist = calc_distance(queries + i * bp.dim, centers_start, bp);
-            if (compare_dist(sh_min_dtcs[tid], dist, bp)) {
-                sh_min_dtcs[tid] = dist;
-                sh_min_ids[tid] = i;
-            }
-        }
-        __syncthreads();
-        // 归约找到 centroid 向量：每次一半线程参与
-        for (int stride = tpb / 2; stride > 0; stride >>= 1) {
-            if (tid < stride)
-                if (compare_dist(sh_min_dtcs[tid], sh_min_dtcs[tid + stride], bp)) {
-                    sh_min_dtcs[tid] = sh_min_dtcs[tid + stride];
-                    sh_min_ids[tid] = sh_min_ids[tid + stride];
-                }
-            __syncthreads();
-        }
-        if (tid == 0 && centroid_ids[cluster_idx] != sh_min_ids[0]) {
-            centroid_ids[cluster_idx] = sh_min_ids[0];
-            *not_converge = 1;
-            cluster_sizes[cluster_idx] = *sh_cluster_size;
-        }
+        // for (int i = tid; i < sub_n; i += tpb) {  // 计算 cluster 中每个向量和中心点的距离
+        //     if (labels[i] != cluster_idx) continue;
+        //     const float dist = calc_distance(queries + i * bp.dim, centers_start, bp);
+        //     if (compare_dist(sh_min_dtcs[tid], dist, bp)) {
+        //         sh_min_dtcs[tid] = dist;
+        //         sh_min_ids[tid] = i;
+        //     }
+        // }
+        // __syncthreads();
+        // // 归约找到 centroid 向量：每次一半线程参与
+        // for (int stride = tpb / 2; stride > 0; stride >>= 1) {
+        //     if (tid < stride)
+        //         if (compare_dist(sh_min_dtcs[tid], sh_min_dtcs[tid + stride], bp)) {
+        //             sh_min_dtcs[tid] = sh_min_dtcs[tid + stride];
+        //             sh_min_ids[tid] = sh_min_ids[tid + stride];
+        //         }
+        //     __syncthreads();
+        // }
+        // if (tid == 0 && centroid_ids[cluster_idx] != sh_min_ids[0]) {
+        //     centroid_ids[cluster_idx] = sh_min_ids[0];
+        //     *not_converge = 1;
+        // }
     }
 }
 
-__global__ void gather_sub_queries_kernel(const float *__restrict__ queries,
-                                          const int *__restrict__ idxs,
-                                          float *__restrict__ sub_queries, BP bp, int sub_n) {
-    const int block_num = gridDim.x, tpb = blockDim.x, bid = blockIdx.x, tid = threadIdx.x;
-    for (int i = bid * block_num + tid; i < sub_n; i += block_num * tpb)
-        for (int d = 0; d < bp.dim; ++d)
-            sub_queries[i * bp.dim + d] = queries[idxs[i] * bp.dim + d];
+__global__ void gather_sub_queries_kernel(const float* __restrict__ queries,
+                                          const int* __restrict__ idxs,
+                                          float* __restrict__ sub_queries, int sub_n, int dim) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < sub_n; i += gridDim.x * blockDim.x)
+        for (int d = 0; d < dim; ++d) sub_queries[i * dim + d] = queries[idxs[i] * dim + d];
 }
 
-__global__ void cluster_size_statistics_kernel(const int *__restrict__ labels,
-                                               int *__restrict__ cluster_sizes, int K, int n) {
+__global__ void cluster_size_statistics_kernel(const int* __restrict__ labels,
+                                               int* __restrict__ cluster_sizes, int K, int n) {
     const int block_num = gridDim.x, tpb = blockDim.x, bid = blockIdx.x, tid = threadIdx.x;
     extern __shared__ int sh_cluster_sizes[];
     for (int cluster_idx = tid; cluster_idx < K; cluster_idx += tpb)
@@ -143,10 +160,10 @@ __global__ void cluster_size_statistics_kernel(const int *__restrict__ labels,
         atomicAdd(cluster_sizes + cluster_idx, sh_cluster_sizes[cluster_idx]);
 }
 
-__global__ void query_cluster_bucket_kernel(const float *__restrict__ queries,
-                                            const int *__restrict__ labels,
-                                            const int *__restrict__ cluster_offsets,
-                                            float *__restrict__ bucket_queries, int K, BP bp) {
+__global__ void query_cluster_bucket_kernel(const float* __restrict__ queries,
+                                            const int* __restrict__ labels,
+                                            const int* __restrict__ cluster_offsets,
+                                            float* __restrict__ bucket_queries, int K, BP bp) {
     const int block_num = gridDim.x, tpb = blockDim.x, bid = blockIdx.x, tid = threadIdx.x;
     extern __shared__ int sh_cluster_member_idx[];
     for (int cluster_idx = bid; cluster_idx < K; cluster_idx += block_num) {
@@ -157,7 +174,7 @@ __global__ void query_cluster_bucket_kernel(const float *__restrict__ queries,
 #ifdef GPU_TEST
         assert(offset >= 0 && offset < bp.query_n);
 #endif
-        float *queries_start = bucket_queries + offset * bp.dim;
+        float* queries_start = bucket_queries + offset * bp.dim;
         for (int i = tid; i < bp.query_n; i += tpb) {
             if (labels[i] != cluster_idx) continue;
             const int idx = atomicAdd(sh_cluster_member_idx, 1);
@@ -173,10 +190,10 @@ __global__ void query_cluster_bucket_kernel(const float *__restrict__ queries,
     }
 }
 
-__global__ void query_round_robin_kernel(const float *__restrict__ queries,
-                                         const int *__restrict__ cluster_sizes,
-                                         const int *__restrict__ cluster_offsets,
-                                         float *__restrict__ round_queries, int K, BP bp) {
+__global__ void query_round_robin_kernel(const float* __restrict__ queries,
+                                         const int* __restrict__ cluster_sizes,
+                                         const int* __restrict__ cluster_offsets,
+                                         float* __restrict__ round_queries, int K, BP bp) {
     const int block_num = gridDim.x, tpb = blockDim.x, bid = blockIdx.x, tid = threadIdx.x;
     for (int idx = bid * tpb + tid; idx < bp.query_n; idx += block_num * tpb) {
         int cnt = 0;
@@ -193,18 +210,15 @@ __global__ void query_round_robin_kernel(const float *__restrict__ queries,
     }
 }
 
-void GPUFuncs::query_data_kmeans(float *h_queries, int K) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    std::string stream_name = "knn";
-    cudaStream_t &stream = streams[stream_name].stream;
+void GPUFuncs::query_data_kmeans(float* h_queries, int K) {
+    cudaStream_t& stream = streams["knn"].stream;
 
     const size_t query_data_size = bp.query_n * bp.dim * sizeof(float);
     thrust::device_vector<float> d_queries(bp.query_n * bp.dim);
     int *d_not_converge, not_converge = 1;
     const int tpb = 256;
 
-    event_record_time_start(stream_name);
+    auto e = gpu_record_time_start(stream);
 
     CUDA_CHECK(cudaMallocAsync(&d_not_converge, sizeof(int), stream));
     CUDA_CHECK(cudaMemcpyAsync(d_queries.data().get(), h_queries, query_data_size,
@@ -212,96 +226,92 @@ void GPUFuncs::query_data_kmeans(float *h_queries, int K) {
 
     // 随机采样子集
     const int sub_n = KMEANS_SIZE_RATIO * bp.query_n;
-    thrust::device_vector<int> d_idxs(bp.query_n), d_centroid_ids(K);
+    thrust::device_vector<int> d_idxs(bp.query_n);
+    thrust::device_vector<float> d_sub_queries(sub_n * bp.dim), d_centroids(K * bp.dim);
+    std::vector<float> centroids(K * bp.dim);
     thrust::sequence(thrust::cuda::par.on(stream), d_idxs.begin(),
                      d_idxs.end());  // 索引 [0..N-1]
     thrust::shuffle(thrust::cuda::par.on(stream), d_idxs.begin(), d_idxs.end(),
                     thrust::default_random_engine(1234));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     d_idxs.resize(sub_n);  // 保留前 sub_n 个
 
-    thrust::device_vector<float> d_sub_queries((size_t)sub_n * bp.dim);
     // gather 子集数据
     gather_sub_queries_kernel<<<256, tpb, 0, stream>>>(d_queries.data().get(), d_idxs.data().get(),
-                                                       d_sub_queries.data().get(), bp, sub_n);
+                                                       d_sub_queries.data().get(), sub_n, bp.dim);
 
     // 从子集随机选择 K 个点作为初始中心
     thrust::sequence(thrust::cuda::par.on(stream), d_idxs.begin(), d_idxs.begin() + sub_n);
     thrust::shuffle(thrust::cuda::par.on(stream), d_idxs.begin(), d_idxs.begin() + sub_n,
                     thrust::default_random_engine(5678));
-    thrust::copy_n(thrust::cuda::par.on(stream), d_idxs.begin(), K, d_centroid_ids.begin());
+    // thrust::copy_n(thrust::cuda::par.on(stream), d_idxs.begin(), K, d_centroid_ids.begin());
+    // centroid_init_kernel<<<512, 128, 0, stream>>>(d_sub_queries.data().get(),
+    // d_idxs.data().get(),
+    //                                               d_centroids.data().get(), bp, K);
+    gather_sub_queries_kernel<<<256, tpb, 0, stream>>>(
+        d_sub_queries.data().get(), d_idxs.data().get(), d_centroids.data().get(), K, bp.dim);
 
-    thrust::device_vector<int> d_labels(bp.query_n);
-    thrust::device_vector<float> d_centers((size_t)K * tpb * bp.dim);
-    thrust::device_vector<int> d_cluster_sizes(K), d_cluster_offsets(K, 0);
-
-    float time = event_record_time_stop(stream_name, "kmeans_prepare") / 1000.0;
+    thrust::device_vector<int> d_labels(bp.query_n, 0);
+    thrust::device_vector<float> d_vec_sums((size_t)K * tpb * bp.dim);
 
     // 迭代 K-means
-    std::vector<int> centroid_ids(K), last_centroid_ids(K);
-    for (int iter = 0; iter < KMEANS_MAX_ITERS && not_converge; iter++) {
-        event_record_time_start(stream_name);
+    for (int iter = 0; iter < KMEANS_MAX_ITERS; iter++) {
         // 1) 分配簇标签
-        cluster_assign_kernel<<<K, tpb, 0, stream>>>(d_sub_queries.data().get(),
-                                                     d_centroid_ids.data().get(),
-                                                     d_labels.data().get(), bp, K, sub_n);
-
-        // 2) 聚合更新质心
-        const size_t shared_size = tpb * sizeof(float) + (tpb + 1) * (sizeof(int));
-        assert(shared_size < shared_mem_per_block);
-        thrust::fill(thrust::cuda::par.on(stream), d_cluster_sizes.begin(), d_cluster_sizes.end(),
-                     0);
-        compute_centroid_kernel<<<512, 256, shared_size, stream>>>(
-            d_sub_queries.data().get(), d_labels.data().get(), d_centers.data().get(),
-            d_centroid_ids.data().get(), d_not_converge, d_cluster_sizes.data().get(), bp, K,
-            sub_n);
-
+        CUDA_CHECK(cudaMemsetAsync(d_not_converge, 0, sizeof(int), stream));
+        cluster_assign_kernel<<<512, tpb, (bp.dim + K) * sizeof(float) + K * sizeof(int),
+                                stream>>>(d_sub_queries.data().get(), d_centroids.data().get(),
+                                          d_labels.data().get(), d_not_converge, bp, K, sub_n);
         CUDA_CHECK(cudaMemcpyAsync(&not_converge, d_not_converge, sizeof(int),
                                    cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(centroids.data(), d_centroids.data().get(),
+                                   sizeof(float) * K * bp.dim, cudaMemcpyDeviceToHost, stream));
+        cudaStreamSynchronize(stream);
+        // float time = event_record_time_stop(stream_name, "kmeans_loop") / 1000.0;
+        // std::string idstr;
+        // for (int i = 0; i < K; i++) idstr += std::to_string(centroids[i * bp.dim]) + " ";
+        // fo.print("Kmeans Step " + TOS(iter) + " time: " + TOS(time) + "s");
+        // fo.print("Kmeans Step " + TOS(iter) + " time: " + TOS(time) + "s\n" + idstr);
+        if (iter && !not_converge) break;
 
-        time = event_record_time_stop(stream_name, "kmeans_loop") / 1000.0;
-        cudaMemcpy(centroid_ids.data(), d_centroid_ids.data().get(), K * sizeof(int),
-                   cudaMemcpyDeviceToHost);
-        std::string idstr;
-        if (!iter)
-            for (int i = 0; i < K; i++) idstr += std::to_string(centroid_ids[i]) + " ";
-        else
-            for (int i = 0; i < K; i++)
-                idstr += (centroid_ids[i] == last_centroid_ids[i]
-                              ? std::string(numDigits(centroid_ids[i]), '_')
-                              : std::to_string(centroid_ids[i])) +
-                         " ";
+        // 2) 聚合更新质心
+        // event_record_time_start(stream_name);
+        const size_t shared_size = tpb * sizeof(float) + (tpb + 1) * (sizeof(int));
+        assert(shared_size < shared_mem_per_block);
+        compute_centroid_kernel<<<512, tpb, shared_size, stream>>>(
+            d_sub_queries.data().get(), d_labels.data().get(), d_vec_sums.data().get(),
+            d_centroids.data().get(), bp, K, sub_n);
 
-        last_centroid_ids = centroid_ids;  // deepcopy
+        // cudaMemcpy(centroid_ids.data(), d_centroid_ids.data().get(), K * sizeof(int),
+        //            cudaMemcpyDeviceToHost);
+        // std::string idstr;
+        // if (!iter)
+        //     for (int i = 0; i < K; i++) idstr += std::to_string(centroid_ids[i]) + " ";
+        // else
+        //     for (int i = 0; i < K; i++)
+        //         idstr += (centroid_ids[i] == last_centroid_ids[i]
+        //                       ? std::string(numDigits(centroid_ids[i]), '_')
+        //                       : std::to_string(centroid_ids[i])) +
+        //                  " ";
 
-        fo.print("Kmeans Step " + TOS(iter) + " time: " + TOS(time) + "s\n" + idstr);
+        // last_centroid_ids = centroid_ids;  // deepcopy
     }
 
-    event_record_time_start(stream_name);
+    // event_record_time_start(stream_name);
 
     CUDA_CHECK(cudaFreeAsync(d_not_converge, stream));
     fo.print(not_converge ? "Not Converged but finished!" : "Converged!");
 
     // 对所有查询分配簇标签
-    cluster_assign_kernel<<<K, tpb, 0, stream>>>(d_queries.data().get(),
-                                                 d_centroid_ids.data().get(),
-                                                 d_labels.data().get(), bp, K, bp.query_n);
+    cluster_assign_kernel<<<1024, tpb, (bp.dim + K) * sizeof(float) + K * sizeof(int), stream>>>(
+        d_queries.data().get(), d_centroids.data().get(), d_labels.data().get(), nullptr, bp, K,
+        bp.query_n);
     // 统计每个聚类的查询数量，然后求前缀和
+    thrust::device_vector<int> d_cluster_sizes(K), d_cluster_offsets(K, 0);
     thrust::fill(thrust::cuda::par.on(stream), d_cluster_sizes.begin(), d_cluster_sizes.end(), 0);
     cluster_size_statistics_kernel<<<256, tpb, K * sizeof(int), stream>>>(
         d_labels.data().get(), d_cluster_sizes.data().get(), K, bp.query_n);
     prefix_exclusive_sum(d_cluster_sizes.data().get(), d_cluster_offsets.data().get(), K,
                          stream);  // 求前缀和
-    // std::vector<int> cluster_sizes(K), cluster_offsets(K);
-    // std::string size_str, offset_str;
-    // cudaMemcpy(cluster_sizes.data(), d_cluster_sizes.data().get(), K * sizeof(int),
-    //            cudaMemcpyDeviceToHost);
-    // cudaMemcpy(cluster_offsets.data(), d_cluster_offsets.data().get(), K * sizeof(int),
-    //            cudaMemcpyDeviceToHost);
-    // for (int i = 0; i < K; i++) {
-    //     size_str += std::to_string(cluster_sizes[i]) + " ";
-    //     offset_str += std::to_string(cluster_offsets[i]) + " ";
-    // }
-    // fo.print("Cluster Sizes: " + size_str + "\nCluster Offsets: " + offset_str);
 
     thrust::device_vector<float> d_queries_temp(bp.query_n * bp.dim);
     query_cluster_bucket_kernel<<<K, tpb, sizeof(int), stream>>>(
@@ -313,11 +323,8 @@ void GPUFuncs::query_data_kmeans(float *h_queries, int K) {
     CUDA_CHECK(cudaMemcpyAsync(h_queries, d_queries.data().get(), query_data_size,
                                cudaMemcpyDeviceToHost, stream));
 
-    event_record_time_stop(stream_name, "kmeans") / 1000.0;
-
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::high_resolution_clock::now() - start_time);
-    fo.iprint("Total kmeans time cost: " + TOS(duration.count()) + "s");
+    const float time = gpu_record_time_stop(e, stream);
+    fo.iprint("Total kmeans time cost: " + TOS(time) + "s");
 }
 
 }  // namespace efanna2e

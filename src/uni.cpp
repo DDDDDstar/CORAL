@@ -14,29 +14,41 @@
 
 using namespace efanna2e;
 
+int testAndSetBit(int* bitset, int bit_index) {
+    int *addr = bitset + (bit_index >> 5), mask = 1 << (bit_index & 31), old = *addr;
+    if (old & mask) return 1;  // 已经是 1
+
+    *addr = old | mask;  // 直接置位
+    return 0;            // 成功从 0 -> 1
+}
+
 int numDigits(int n) {
     n = std::abs(n);       // 处理负数
     if (n == 0) return 1;  // 特判 0
     return static_cast<int>(std::log10(n)) + 1;
 }
 
-BatchResult::BatchResult(int *d_knn, const int k, const int batch, const double time_ms)
-    : batch(batch), time_ms(time_ms) {
-    knn.resize(k * batch, -1);
+BatchResult::BatchResult(int* d_knn, const int k, const int batch, const double time_s)
+    : batch(batch), time_s(time_s) {
+    knn.assign(k * batch, -1);
     cudaMemcpy(knn.data(), d_knn, batch * k * sizeof(int), cudaMemcpyDeviceToHost);
+    std::string res;
+    bool right = true;
     for (int i = 0; i < batch * k; i++) {
-        assert(knn[i] >= 0);
+        res += TOS(knn[i]) + " ";
+        if (knn[i] < 0) right = false;
     }
+    if (!right) fo.eprint("knn error: " + res);
 }
 
 BatchResult::BatchResult(const int k, const int batch) : batch(batch) { knn.resize(k * batch); }
 
-void writeCSV(const std::vector<std::vector<std::string>> &data, const std::string &filename,
+void writeCSV(const std::vector<std::vector<std::string>>& data, const std::string& filename,
               const std::ios_base::openmode mode) {
     std::ofstream file(filename, mode);
     if (!file.is_open()) fo.eprint("writeCSV: Can not open file: " + filename);
 
-    for (const auto &row : data) {
+    for (const auto& row : data) {
         for (size_t i = 0; i < row.size(); ++i) {
             file << row[i];
             if (i < row.size() - 1) file << ",";  // 逗号分隔

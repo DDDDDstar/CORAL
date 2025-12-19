@@ -10,7 +10,7 @@ iso_thres=0.7
 deg_thres=10
 recall_thres=99
 recall=0.98
-dist=ip
+dist=l2
 version=2
 # suffix=_${dist}${version}_${recall_thres}_${date}
 # suffix1=_${dist}${version}
@@ -21,7 +21,8 @@ rm -r build
 mkdir build
 cp ./prepare.sh ./build/prepare.sh
 cd build
-$CONDA_PREFIX/bin/cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_BUILD_TYPE=Debug -Wno-dev 
+/usr/bin/cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_BUILD_TYPE=Debug -Wno-dev
+# $CONDA_PREFIX/bin/cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_BUILD_TYPE=Debug -Wno-dev
 # cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_BUILD_TYPE=Debug -DCUDAToolkit_ROOT=/usr/local/cuda-11.4 -Wno-dev 
 make -j &> make.log
 
@@ -42,4 +43,11 @@ else
     --sampled_query_data_path ${prefix}/queries/query.train.10M.fbin \
     --recall_thres ${recall_thres} \
     --CE ${CE} --k ${topk} --M_sq 100 --M_pjbp 35 --L_pjpq 500 -T 64
+
+#     nohup time ./tests/test_build_pipeline \
+# --dataset ${dataset} --data_type float --dist ${dist} \
+# --base_data_path ${prefix}/base.10M.fbin \
+# --sampled_query_data_path ${prefix}/queries/query.train.10M.fbin \
+# --recall_thres ${recall_thres} \
+# --CE ${CE} --k ${topk} --M_sq 100 --M_pjbp 35 --L_pjpq 500 -T 64 &
 fi

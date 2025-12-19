@@ -10,57 +10,61 @@
 #include "utils.cuh"
 
 namespace efanna2e {
-__global__ void candidate_ignore_kernel(const float *__restrict__ base, CN *cand_nbrs,
-                                        int *sort_idxs, int *nbr_num, const int new_nbr_i,
-                                        const int batch, int cand_size, int vec_num, BP bp) {
-    const int bid = blockIdx.x, tid = threadIdx.x, tpb = blockDim.x;
-    for (int group_id = bid; group_id < batch; group_id += gridDim.x) {
-        for (int pivot_idx = tid; pivot_idx < vec_num; pivot_idx += tpb) {
-            CN *new_nbr =
-                get_CN(cand_nbrs, sort_idxs, new_nbr_i, group_id, pivot_idx, vec_num, cand_size);
-            // 无效节点或邻居已满，直接淘汰
-            if (new_nbr->id == -1 || nbr_num[group_id * vec_num + pivot_idx] >= bp.max_degree)
-                new_nbr->status = Discarded;
-            else if (new_nbr->status == Initial)  // 待定节点，保留且用于淘汰后续节点
-            {
-                new_nbr->status = Retained;
-                nbr_num[group_id * vec_num + pivot_idx]++;
-                const int wti_num = cand_size - new_nbr_i - 1;
-                for (int i = 0; i < wti_num; i++) {
-                    CN *wti_cand_nbr = get_CN(cand_nbrs, sort_idxs, i + new_nbr_i + 1, group_id,
-                                              pivot_idx, vec_num, cand_size);  // 待淘汰候选邻居
-                    if (wti_cand_nbr->status == Initial) {
-                        // 如果新邻居和待淘汰候选邻居是同一个节点，则直接淘汰
-                        if (new_nbr->id == wti_cand_nbr->id) wti_cand_nbr->status = Repeated;
-                        // 否则，比较 pivot 到待淘汰候选邻居的距离和新邻居到待淘汰候选邻居距离(ip
-                        // 取负)
-                        else if (compare_dist(
-                                     wti_cand_nbr->dist,
-                                     calc_distance(base, wti_cand_nbr->id, new_nbr->id, bp), bp))
-                            wti_cand_nbr->status = Discarded;  // 淘汰
-                    }
-                }
-            } else if (new_nbr->status == AllRetained)  // 候选邻居数量小于 max_degree，只需要判重
-            {
-                const int wti_num = cand_size - new_nbr_i - 1;
-                for (int i = 0; i < wti_num; i++) {
-                    CN *wti_cand_nbr = get_CN(cand_nbrs, sort_idxs, i + new_nbr_i + 1, group_id,
-                                              pivot_idx, vec_num, cand_size);
-                    if (wti_cand_nbr->id == new_nbr->id) wti_cand_nbr->status = Repeated;  // 淘汰
-                }
-            }
-        }
-    }
-}
+// __global__ void candidate_ignore_kernel(CN* cand_nbrs, int* sort_idxs, int* nbr_num,
+//                                         const int new_nbr_i, const int batch, int cand_size,
+//                                         int vec_num, BP bp) {
+//     const int bid = blockIdx.x, tid = threadIdx.x, tpb = blockDim.x;
+//     for (int group_id = bid; group_id < batch; group_id += gridDim.x) {
+//         for (int pivot_idx = tid; pivot_idx < vec_num; pivot_idx += tpb) {
+//             CN* new_nbr =
+//                 get_CN(cand_nbrs, sort_idxs, new_nbr_i, group_id, pivot_idx, vec_num,
+//                 cand_size);
+//             // 无效节点或邻居已满，直接淘汰
+//             if (new_nbr->id == -1 || nbr_num[group_id * vec_num + pivot_idx] >= bp.max_degree)
+//                 new_nbr->status = Discarded;
+//             else if (new_nbr->status == Initial)  // 待定节点，保留且用于淘汰后续节点
+//             {
+//                 new_nbr->status = Retained;
+//                 nbr_num[group_id * vec_num + pivot_idx]++;
+//                 const int wti_num = cand_size - new_nbr_i - 1;
+//                 for (int i = 0; i < wti_num; i++) {
+//                     CN* wti_cand_nbr = get_CN(cand_nbrs, sort_idxs, i + new_nbr_i + 1, group_id,
+//                                               pivot_idx, vec_num, cand_size);  // 待淘汰候选邻居
+//                     if (wti_cand_nbr->status == Initial) {
+//                         // 如果新邻居和待淘汰候选邻居是同一个节点，则直接淘汰
+//                         if (new_nbr->id == wti_cand_nbr->id) wti_cand_nbr->status = Repeated;
+//                         // 否则，比较 pivot
+//                         到待淘汰候选邻居的距离和新邻居到待淘汰候选邻居距离(ip
+//                         // 取负)
+//                         else if (compare_dist(wti_cand_nbr->dist,
+//                                               calc_distance(wti_cand_nbr->vec, new_nbr->vec,
+//                                               bp), bp))
+//                             wti_cand_nbr->status = Discarded;  // 淘汰
+//                     }
+//                 }
+//             } else if (new_nbr->status == AllRetained)  // 候选邻居数量小于
+//             max_degree，只需要判重
+//             {
+//                 const int wti_num = cand_size - new_nbr_i - 1;
+//                 for (int i = 0; i < wti_num; i++) {
+//                     CN* wti_cand_nbr = get_CN(cand_nbrs, sort_idxs, i + new_nbr_i + 1, group_id,
+//                                               pivot_idx, vec_num, cand_size);
+//                     if (wti_cand_nbr->id == new_nbr->id) wti_cand_nbr->status = Repeated;  //
+//                     淘汰
+//                 }
+//             }
+//         }
+//     }
+// }
 
-__global__ void get_new_nbrs_kernel(CN *cand_nbrs, const int *sort_idxs, int *new_nbr_ids,
-                                    float *new_nbr_dists, int cand_size, BP bp) {
+__global__ void get_new_nbrs_kernel(CN* cand_nbrs, const int* sort_idxs, int* new_nbr_ids,
+                                    float* new_nbr_dists, int cand_size, BP bp) {
     const int group_id = blockIdx.x, tid = threadIdx.x, tpb = blockDim.x;
     for (int i = tid; i < bp.k; i += tpb) {
         int nbr_num = 0;
         for (int j = 0; j < cand_size && nbr_num < bp.max_degree; j++) {
-            const CN *cand_nbr = get_CN(cand_nbrs, sort_idxs, j, group_id, i, bp.k, cand_size);
-            if (cand_nbr->status == Retained || cand_nbr->status == AllRetained) {
+            const CN* cand_nbr = get_CN(cand_nbrs, sort_idxs, j, group_id, i, bp.k, cand_size);
+            if (cand_nbr->status == Retained) {
                 const int idx = group_id * bp.k * bp.max_degree + i * bp.max_degree + nbr_num++;
                 // assert(cand_nbr.id != -1);
                 new_nbr_ids[idx] = cand_nbr->id;
@@ -69,8 +73,7 @@ __global__ void get_new_nbrs_kernel(CN *cand_nbrs, const int *sort_idxs, int *ne
         }
 
         for (int j = 0; j < cand_size && nbr_num < bp.max_degree; j++) {
-            const CN *cand_nbr = get_CN(cand_nbrs, sort_idxs, j, group_id, i, bp.k, cand_size);
-            if (cand_nbr->status == AllRetained) break;
+            const CN* cand_nbr = get_CN(cand_nbrs, sort_idxs, j, group_id, i, bp.k, cand_size);
 
             if (cand_nbr->id >= 0 && cand_nbr->status == Discarded) {
                 const int idx = group_id * bp.k * bp.max_degree + i * bp.max_degree + nbr_num++;
@@ -82,11 +85,11 @@ __global__ void get_new_nbrs_kernel(CN *cand_nbrs, const int *sort_idxs, int *ne
     }
 }
 #ifdef algo0
-__global__ void add_reverse_kernel(CN *cand_nbrs, const int *d_old_nbrs,
-                                   const float *d_old_nbr_dists, const int *d_old_nbr_nums,
+__global__ void add_reverse_kernel(CN* cand_nbrs, const int* d_old_nbrs,
+                                   const float* d_old_nbr_dists, const int* d_old_nbr_nums,
                                    BP bp) {
     const int batch_id = blockIdx.x, tid = threadIdx.x, tpb = blockDim.x;
-    const CN *pivot_nbr_start = cand_nbrs + batch_id * bp.k * bp.cand_size;
+    const CN* pivot_nbr_start = cand_nbrs + batch_id * bp.k * bp.cand_size;
 
     for (int idx = tid + 1; idx < bp.k; idx += tpb) {
         const int old_nbr_num = d_old_nbr_nums[batch_id * bp.k + idx];
@@ -118,8 +121,8 @@ __global__ void add_reverse_kernel(CN *cand_nbrs, const int *d_old_nbrs,
     }
 }
 
-__global__ void pivot_to_others_dist_compute_kernel(const float *__restrict__ base,
-                                                    const int *__restrict__ knns, CN *cand_nbrs,
+__global__ void pivot_to_others_dist_compute_kernel(const float* __restrict__ base,
+                                                    const int* __restrict__ knns, CN* cand_nbrs,
                                                     BP bp) {
     const int group_id = blockIdx.x, tid = threadIdx.x, tpb = blockDim.x;
     const int pivot_idx = knns[group_id * bp.k];  // pivot 向量在 base 中的开始索引
@@ -147,17 +150,17 @@ __global__ void pivot_to_others_dist_compute_kernel(const float *__restrict__ ba
 #endif
 
 #ifndef GIG
-__global__ void knn_dist_compute_kernel(const float *__restrict__ base,
-                                        const int *__restrict__ knns, const int *d_old_nbrs,
-                                        const float *d_old_nbr_dists, const int *d_old_nbr_nums,
-                                        CN *cand_nbrs, int tile_k, BP bp) {
+__global__ void knn_dist_compute_kernel(const float* __restrict__ base,
+                                        const int* __restrict__ knns, const int* d_old_nbrs,
+                                        const float* d_old_nbr_dists, const int* d_old_nbr_nums,
+                                        CN* cand_nbrs, int tile_k, BP bp) {
     const int batch_id = blockIdx.x, tid = threadIdx.x, tpb = blockDim.x;
     extern __shared__ unsigned char shared_mem[];
     uintptr_t smem_ptr = reinterpret_cast<uintptr_t>(shared_mem);  // 基地址
     // 存储一个 tile 的基础向量，大小为 tile_k * dim:
-    float *tile_row_vecs = reinterpret_cast<float *>(smem_ptr);
+    float* tile_row_vecs = reinterpret_cast<float*>(smem_ptr);
     smem_ptr += tile_k * bp.dim * sizeof(float);  // 偏移字节数
-    int *old_nbr_nums = reinterpret_cast<int *>(smem_ptr);
+    int* old_nbr_nums = reinterpret_cast<int*>(smem_ptr);
 
     for (int i = tid; i < bp.k; i += tpb) old_nbr_nums[i] = d_old_nbr_nums[batch_id * bp.k + i];
     __syncthreads();
@@ -218,7 +221,7 @@ __global__ void knn_dist_compute_kernel(const float *__restrict__ base,
                     cand_nbrs[matrix_idx].status = cand_nbrs[sym_matrix_idx].status = Discarded;
                 } else {
                     const int col_base_id = knns[batch_id * bp.k + global_col];
-                    const float *row_vec = tile_row_vecs + local_row * bp.dim;
+                    const float* row_vec = tile_row_vecs + local_row * bp.dim;
                     // 候选邻居到 pivot 的距离:
                     cand_nbrs[matrix_idx].dist = cand_nbrs[sym_matrix_idx].dist =
                         bp.metric == DIST_METRIC::L2
@@ -240,7 +243,7 @@ __global__ void knn_dist_compute_kernel(const float *__restrict__ base,
 }
 #endif
 
-void idx_dist_extract(CN *nbrs, int *idxs, float *dists, cudaStream_t &stream, int num, BP bp) {
+void idx_dist_extract(CN* nbrs, int* idxs, float* dists, cudaStream_t& stream, int num, BP bp) {
     thrust::device_ptr<CN> nbrs_ptr(nbrs);
     thrust::device_ptr<float> dists_ptr(dists);
     thrust::device_ptr<int> idxs_ptr(idxs);
@@ -251,24 +254,22 @@ void idx_dist_extract(CN *nbrs, int *idxs, float *dists, cudaStream_t &stream, i
     // 提取结构体数组 d_cand_nbrs 中的 dist 和 idx 字段，对于 IP 距离，取负实现从大到小排序
     if (bp.metric == DIST_METRIC::L2)
         thrust::transform(thrust::cuda::par.on(stream), nbrs_ptr, nbrs_ptr + num, output_begin,
-                          [] __host__ __device__(const CN &nbr) {
+                          [] __host__ __device__(const CN& nbr) {
                               return thrust::make_tuple(nbr.dist, nbr.idx);
                           });
     else
         thrust::transform(thrust::cuda::par.on(stream), nbrs_ptr, nbrs_ptr + num, output_begin,
-                          [] __host__ __device__(const CN &nbr) {
+                          [] __host__ __device__(const CN& nbr) {
                               return thrust::make_tuple(-nbr.dist, nbr.idx);
                           });
 }
 
 #ifndef GIG
-std::pair<int *, float *> GPUFuncs::handle_knn_updates(const int *d_knn_idxs,
-                                                       const int *d_old_nbrs,
-                                                       const float *d_old_nbr_dists,
-                                                       const int *d_old_nbr_nums,
-                                                       const int batch) {
+std::pair<int*, float*> GPUFuncs::handle_knn_updates(const int* d_knn_idxs, const int* d_old_nbrs,
+                                                     const float* d_old_nbr_dists,
+                                                     const int* d_old_nbr_nums, const int batch) {
     const std::string name = "upd";
-    cudaStream_t &stream = streams[name].stream;
+    cudaStream_t& stream = streams[name].stream;
 
     event_record_time_start(name);
 

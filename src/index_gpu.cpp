@@ -32,10 +32,67 @@ IndexGPU::IndexGPU(const size_t dimension, const size_t n, Metric m, Index* init
 
 IndexGPU::~IndexGPU() {}
 
-void IndexGPU::Build(size_t n, const float* data, const Parameters& parameters) {};
+void IndexGPU::Build(size_t n, const float* data, const Parameters& parameters) {}
 
 void IndexGPU::Search(const float* query, const float* x, size_t k, const Parameters& parameters,
-                      unsigned* indices, float* res_dists) {};
+                      unsigned* indices, float* res_dists) {}
+
+void IndexGPU::RunPrepare(Parameters& parameters) {
+    metric = parameters.Get<std::string>("dist") == "l2" ? DIST_METRIC::L2 : DIST_METRIC::IP;
+    k = parameters.Get<int>("k");
+
+    query_index = new QueryIndex(parameters.Get<std::string>("query_file"), KMEANS_CENTROID_NUM, k,
+                                 dimension_, metric);
+    graph = new Graph(parameters_.Get<std::string>("graph_file"), h_base, GPU_N, u32_nd_,
+                      max_degree, dimension_, k, false);
+    gpufuncs = new GPUFuncs(graph, query_index, u32_nd_, dimension_, k, max_degree, metric,
+                            TEST_SEARCH_L);
+
+    CUDA_CHECK(cudaMallocHost(&h_base, u32_nd_ * dimension_ * sizeof(float)));
+    memcpy(h_base, data_bp_, u32_nd_ * dimension_ * sizeof(float));
+}
+
+void IndexGPU::BuildPrepare() {
+    max_degree = parameters_.Get<int>("M_pjbp");
+    int deviceCount = 0;
+    cudaError_t error = cudaGetDeviceCount(&deviceCount);
+    if (error != cudaSuccess || deviceCount == 0) {
+        fo.eprint("No CUDA-capable GPU found or CUDA driver not installed.");
+    }
+    fo.print("Found " + TOS(deviceCount) + " CUDA-capable device(s).");
+
+    int curDev = -1;
+    cudaGetDevice(&curDev);
+    fo.print("Current device (cudaGetDevice) = " + TOS(curDev));
+
+    CUDA_CHECK(cudaMallocHost(&h_queries, u32_nd_sq_ * dimension_ * sizeof(float)));
+    memcpy(h_queries, data_sq_, u32_nd_sq_ * dimension_ * sizeof(float));
+
+    fo.print("Create graph...");
+    if (u32_nd_ <= CPU_N) {
+        // host 内存分配和传输
+        CUDA_CHECK(cudaMallocHost(&h_base, u32_nd_ * dimension_ * sizeof(float)));
+        memcpy(h_base, data_bp_, u32_nd_ * dimension_ * sizeof(float));
+        graph = new Graph(parameters_.Get<std::string>("graph_file"), h_base, GPU_N, u32_nd_,
+                          max_degree, dimension_, k, true);
+    } else {
+        graph = new Graph(parameters_.Get<std::string>("base_file"),
+                          parameters_.Get<std::string>("graph_file"), u32_nd_, GPU_N, max_degree,
+                          dimension_, k, true);
+    }
+    fo.print("Create gpu function...");
+    gpufuncs = new GPUFuncs(graph, h_base, h_queries, u32_nd_, u32_nd_sq_, dimension_, k,
+                            max_degree, metric, TEST_SEARCH_L);
+
+    fo.print("GPU prepare...");
+}
+
+void IndexGPU::RunFree() {
+    delete query_index;
+    delete graph;
+    delete gpufuncs;
+    CUDA_CHECK(cudaFreeHost(h_base));
+}
 
 void IndexGPU::BuildGPU(size_t n_sq, float* sq_data, size_t n_bp, float* bp_data,
                         Parameters& parameters) {
@@ -56,13 +113,11 @@ void IndexGPU::BuildGPU(size_t n_sq, float* sq_data, size_t n_bp, float* bp_data
     u32_nd_ = static_cast<int>(nd_);
     u32_nd_sq_ = static_cast<int>(nd_sq_);
 
-#ifndef GIG
-    projection_graph_.resize(u32_nd_);
-    projection_graph_deg_.resize(u32_nd_, 0);
-    projection_graph_dist_.resize(u32_nd_);
-#endif
+    // graph.resize(u32_nd_);
+    // graph_deg.resize(u32_nd_, 0);
+    // graph_dist.resize(u32_nd_);
 
-    GPUPrepare();
+    BuildPrepare();
 
     Test test(gpufuncs, h_queries, h_base, dimension_, u32_nd_, k, metric, M_pjbp);
     test.Run();
@@ -89,54 +144,7 @@ void IndexGPU::BuildGPU(size_t n_sq, float* sq_data, size_t n_bp, float* bp_data
 
     fo.print("All done. Copying graph from GPU. Total time: " + TOS(compute_duration_time()));
 
-    GPUFree();
-
-    // stats projection graph degree
-    uint64_t total_degree = 0;
-    int max_deg = 0;
-    int min_deg = std::numeric_limits<int>::max();
-    for (int i = 0; i < u32_nd_; ++i) {
-        const int deg = projection_graph_deg_[i];
-        for (int j = 0; j < deg; ++j)
-            assert(projection_graph_[i][j] >= 0 && projection_graph_[i][j] < u32_nd_);
-
-        max_deg = std::max(max_deg, deg);
-        min_deg = std::min(min_deg, deg);
-
-        total_degree += deg;
-    }
-    fo.print("total degree: " + TOS(total_degree) + "/" + TOS(u32_nd_));
-    fo.print("After projection, average degree of projection graph: " +
-             TOS(total_degree * 1.0 / u32_nd_));
-    fo.print("After projection, max degree of projection graph: " + TOS(max_deg));
-    fo.print("After projection, min degree of projection graph: " + TOS(min_deg));
-
-    CalculateGraphEP();
-}
-
-void IndexGPU::GPUPrepare() {
-    auto max_degree = parameters_.Get<int>("M_pjbp");
-    int deviceCount = 0;
-    cudaError_t error = cudaGetDeviceCount(&deviceCount);
-    if (error != cudaSuccess || deviceCount == 0) {
-        fo.eprint("No CUDA-capable GPU found or CUDA driver not installed.");
-    }
-    fo.print("Found " + TOS(deviceCount) + " CUDA-capable device(s).");
-
-    int curDev = -1;
-    cudaGetDevice(&curDev);
-    fo.print("Current device (cudaGetDevice) = " + TOS(curDev));
-
-    // host 内存分配和传输
-    CUDA_CHECK(cudaMallocHost(&h_base, u32_nd_ * dimension_ * sizeof(float)));
-    memcpy(h_base, data_bp_, u32_nd_ * dimension_ * sizeof(float));
-    CUDA_CHECK(cudaMallocHost(&h_queries, u32_nd_sq_ * dimension_ * sizeof(float)));
-    memcpy(h_queries, data_sq_, u32_nd_sq_ * dimension_ * sizeof(float));
-
-    gpufuncs = new GPUFuncs(h_base, h_queries, u32_nd_, u32_nd_sq_, dimension_, k, max_degree,
-                            metric, TEST_SEARCH_L);
-
-    fo.print("GPU prepare...");
+    BuildFree(cache);
 }
 
 void IndexGPU::KNNTask(KNN_Queue& knn_queue, Cache& cache) {
@@ -165,10 +173,11 @@ void IndexGPU::KNNTask(KNN_Queue& knn_queue, Cache& cache) {
     while (!stop_flag.load() && processed < u32_nd_sq_) {
         int batch = std::min<int>(BATCH, u32_nd_sq_ - processed);
         // 计算 batch 查询的 knn
-        float time_ms;
-        int* d_knn = gpufuncs->knn_compute(batch, processed, time_ms);
+        float time_s = 0.0f;
+        int* d_knn = gpufuncs->knn_compute(nullptr, processed, batch, time_s);
+        // int* d_knn = gpufuncs->knn_compute_nosort(nullptr, processed, batch, time_ms);
 
-        BatchResult res = cache.WriteGTCache(d_knn, batch_id, batch, time_ms);
+        BatchResult res = cache.WriteGTCache(d_knn, batch_id, batch, time_s);
 
         while (!stop_flag.load() && !knn_queue.WriteTail(d_knn, batch, batch_id, KNNType::device))
             continue;
@@ -186,111 +195,57 @@ void IndexGPU::GraphTask(KNN_Queue& knn_queue, Cache& cache) {
     std::thread worker(&IndexGPU::update_graph, this, std::ref(cache), std::ref(graph_mtx),
                        std::ref(knn_queue));
 
-    int *d_knn_idxs, *d_old_nbrs, *d_old_nbr_nums;
-    float* d_old_nbr_dists;
-    CUDA_CHECK(cudaMalloc(&d_knn_idxs, BATCH * k * sizeof(int)));
+    int* d_knn_ids;
+    CUDA_CHECK(cudaMalloc(&d_knn_ids, BATCH * k * sizeof(int)));
 
     int old_batch_id = 0;
     while (!stop_flag.load()) {
-        CUDA_CHECK(cudaMemset(d_knn_idxs, -1, BATCH * k * sizeof(int)));
+        auto s = std::chrono::high_resolution_clock::now();
 
-        int batch_id;
-        int batch = knn_queue.ReadHead(d_knn_idxs, batch_id);
-        while (!stop_flag.load() && batch == -1) batch = knn_queue.ReadHead(d_knn_idxs, batch_id);
-
+        int batch_id, batch = knn_queue.ReadHead(d_knn_ids, batch_id);
+        while (!stop_flag.load() && batch == -1) batch = knn_queue.ReadHead(d_knn_ids, batch_id);
         if (stop_flag.load()) break;
 
-#ifndef GIG
-        CUDA_CHECK(cudaMalloc(&d_old_nbrs, BATCH * k * max_degree * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_old_nbr_dists, BATCH * k * max_degree * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_old_nbr_nums, BATCH * k * sizeof(int)));
-        CUDA_CHECK(cudaMallocHost(&h_old_nbr_nums, BATCH * k * sizeof(int)));
-        CUDA_CHECK(cudaMallocHost(&h_knn_idxs, BATCH * k * sizeof(int)));
+        const float load_time = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::high_resolution_clock::now() - s)
+                                    .count() /
+                                1000.0;
 
-        get_old_nbrs(d_knn_idxs, d_old_nbrs, d_old_nbr_dists, d_old_nbr_nums, batch, max_degree,
-                     graph_mtx);
-        auto res = gpufuncs->handle_knn_updates(d_knn_idxs, d_old_nbrs, d_old_nbr_dists,
-                                                d_old_nbr_nums, batch);
-        Graph_Update_Info gui(d_knn_idxs, res.first, res.second, k, batch, batch_id, max_degree);
-        {
-            std::unique_lock<std::shared_mutex> lock(queue_mtx);
-            graph_update_queue.push(std::move(gui));
-        }
-#else
-        GSD gs = gpufuncs->handle_knn_updates(d_knn_idxs, batch);
-        fo.print("Graph Updated with noniso_ratio: " + TOS(1 - (float)gs.iso_num / u32_nd_) +
-                 ", avg_degree: " + TOS((float)gs.total_degree / u32_nd_) +
-                 ", batch_id: " + TOS(batch_id));
-        if (batch_id - old_batch_id < 100) continue;
+        const float handle_time = gpufuncs->handle_knn_updates(d_knn_ids, batch_id, batch);
+
+        // #ifdef INFO_PRINT
+        //         fo.print("handle_knn_updates(" + TOS(load_time) + "s, " + TOS(handle_time) +
+        //                  "s): batch_id-" + TOS(batch_id));
+        // #endif
+        if (batch_id - old_batch_id < TEST_FREQUENCY) continue;
         {
             std::unique_lock<std::shared_mutex> lock(queue_mtx);
             old_batch_id = batch_id;
-            gui.update(batch_id, gs);
+            gui.update(batch_id);
         }
-#endif
         cv.notify_one();
     }
 
-#ifndef GIG
-    if (worker.joinable()) worker.join();
-    CUDA_CHECK(cudaFree(d_old_nbrs));
-    CUDA_CHECK(cudaFree(d_old_nbr_dists));
-    CUDA_CHECK(cudaFree(d_old_nbr_nums));
-    CUDA_CHECK(cudaFreeHost(h_old_nbr_nums));
-    CUDA_CHECK(cudaFreeHost(h_knn_idxs));
-#endif
-
-    CUDA_CHECK(cudaFree(d_knn_idxs));
-
+    CUDA_CHECK(cudaFree(d_knn_ids));
     fo.print("GraphTask finished...");
 }
 
-#ifndef GIG
-void IndexGPU::get_old_nbrs(int* d_knn_idxs, int* d_old_nbrs, float* d_old_nbr_dists,
-                            int* d_old_nbr_nums, const int batch, const int max_degree,
-                            std::vector<std::shared_mutex>& graph_mtx) {
-    CUDA_CHECK(
-        cudaMemcpy(h_knn_idxs, d_knn_idxs, batch * k * sizeof(int), cudaMemcpyDeviceToHost));
-
-    CUDA_CHECK(cudaMemset(d_old_nbrs, -1, batch * k * max_degree * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_old_nbr_nums, 0, batch * k * sizeof(int)));
-
-    int* h_old_nbrs;
-    float* h_old_nbr_dists;
-    cudaMallocHost(&h_old_nbrs, batch * k * max_degree * sizeof(int));
-    cudaMallocHost(&h_old_nbr_dists, batch * k * max_degree * sizeof(float));
-
-    for (int i = 0; i < batch * k; i++) {
-        const int pivot_id = h_knn_idxs[i];
-        if (pivot_id < 0 || pivot_id >= u32_nd_) fo.eprint("Invalid pivot_id: " + TOS(pivot_id));
-
-        std::shared_lock<std::shared_mutex> lock(graph_mtx[pivot_id]);
-        int size = projection_graph_deg_[pivot_id];
-        h_old_nbr_nums[i] = size;
-        if (!size) continue;
-
-        for (int j = 0; j < size; j++) {
-            if (projection_graph_[pivot_id][j] < 0)
-                fo.eprint("Invalid projection_graph_: " + TOS(projection_graph_[pivot_id][j]) +
-                          " pivot_id: " + TOS(pivot_id) + " j: " + TOS(j) + " size: " + TOS(size));
-
-            h_old_nbrs[i * max_degree + j] = projection_graph_[pivot_id][j];
-            h_old_nbr_dists[i * max_degree + j] = projection_graph_dist_[pivot_id][j];
-        }
-    }
-    CUDA_CHECK(cudaMemcpy(d_old_nbrs, h_old_nbrs, batch * k * max_degree * sizeof(int),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_old_nbr_dists, h_old_nbr_dists, batch * k * max_degree * sizeof(float),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_old_nbr_nums, h_old_nbr_nums, batch * k * sizeof(int),
-                          cudaMemcpyHostToDevice));
-}
-#endif
-
-void IndexGPU::GPUFree() {
+void IndexGPU::BuildFree(Cache& cache) {
     CUDA_CHECK(cudaFreeHost(h_base));
+
+    std::ofstream ofs(parameters_.Get<std::string>("query_file"), std::ios::binary);
+    const int query_size = cache.size();
+    ofs.write((char*)reinterpret_cast<const char*>(&query_size), sizeof(int));
+    ofs.write((char*)reinterpret_cast<const char*>(h_queries),
+              query_size * dimension_ * sizeof(float));
+
+    for (BatchResult& res : cache.results)
+        ofs.write((char*)reinterpret_cast<const char*>(res.knn.data()), k * sizeof(int));
+
     CUDA_CHECK(cudaFreeHost(h_queries));
+
     delete gpufuncs;
+
     fo.print("GPU free...");
 }
 
@@ -357,58 +312,58 @@ std::pair<int, int> IndexGPU::SearchPipe(const float* query, size_t k, size_t& q
     return std::make_pair(cmps, hops);
 }
 
-void IndexGPU::CalculateGraphEP() {
-    float* center = new float[dimension_]();
-    memset(center, 0, sizeof(float) * dimension_);
-    // calculate centroid in base point
-    for (size_t i = 0; i < nd_; ++i) {
-        for (size_t d = 0; d < dimension_; ++d) {
-            center[d] += data_bp_[i * dimension_ + d];
-        }
-    }
+// void IndexGPU::CalculateGraphEP() {
+//     float* center = new float[dimension_]();
+//     memset(center, 0, sizeof(float) * dimension_);
+//     // calculate centroid in base point
+//     for (size_t i = 0; i < nd_; ++i) {
+//         for (size_t d = 0; d < dimension_; ++d) {
+//             center[d] += data_bp_[i * dimension_ + d];
+//         }
+//     }
 
-    for (size_t d = 0; d < dimension_; ++d) {
-        center[d] /= (float)nd_;
-    }
+//     for (size_t d = 0; d < dimension_; ++d) {
+//         center[d] /= (float)nd_;
+//     }
 
-    float* distances = new float[nd_]();
-    memset(distances, 0, sizeof(float) * nd_);
-#pragma omp parallel for
-    for (size_t i = 0; i < nd_; ++i) {
-        const float* cur_data = data_bp_ + i * dimension_;
-        float diff = 0;
-        for (size_t j = 0; j < dimension_; ++j) {
-            diff += ((center[j] - cur_data[j]) * (center[j] - cur_data[j]));
-        }
-        distances[i] = diff;
-    }
+//     float* distances = new float[nd_]();
+//     memset(distances, 0, sizeof(float) * nd_);
+// #pragma omp parallel for
+//     for (size_t i = 0; i < nd_; ++i) {
+//         const float* cur_data = data_bp_ + i * dimension_;
+//         float diff = 0;
+//         for (size_t j = 0; j < dimension_; ++j) {
+//             diff += ((center[j] - cur_data[j]) * (center[j] - cur_data[j]));
+//         }
+//         distances[i] = diff;
+//     }
 
-    int closest = 0;
-    for (size_t i = 1; i < nd_; ++i) {
-        if (projection_graph_[i].size() > 0 &&
-            distances[i] < distances[closest]) {  // 孤立节点不可为质心
-            closest = static_cast<int>(i);
-        }
-    }
-    projection_ep_ = closest;
-    delete[] center;
-    delete[] distances;
-}
+//     int closest = 0;
+//     for (size_t i = 1; i < nd_; ++i) {
+//         if (projection_graph_[i].size() > 0 &&
+//             distances[i] < distances[closest]) {  // 孤立节点不可为质心
+//             closest = static_cast<int>(i);
+//         }
+//     }
+//     projection_ep_ = closest;
+//     delete[] center;
+//     delete[] distances;
+// }
 
-void IndexGPU::SaveIndex(const char* filename) {
-    std::ofstream out(filename, std::ios::binary | std::ios::out);
-    if (!out.is_open()) {
-        throw std::runtime_error("cannot open file");
-    }
-    out.write((char*)&projection_ep_, sizeof(int));
-    out.write((char*)&u32_nd_, sizeof(int));
-    for (int i = 0; i < u32_nd_; ++i) {
-        int nbr_size = projection_graph_deg_[i];
-        out.write((char*)&nbr_size, sizeof(int));
-        out.write((char*)projection_graph_[i].data(), sizeof(int) * nbr_size);
-    }
-    out.close();
-}
+// void IndexGPU::SaveIndex(const char* filename) {
+//     std::ofstream out(filename, std::ios::binary | std::ios::out);
+//     if (!out.is_open()) {
+//         throw std::runtime_error("cannot open file");
+//     }
+//     out.write((char*)&projection_ep_, sizeof(int));
+//     out.write((char*)&u32_nd_, sizeof(int));
+//     for (int i = 0; i < u32_nd_; ++i) {
+//         int nbr_size = projection_graph_deg_[i];
+//         out.write((char*)&nbr_size, sizeof(int));
+//         out.write((char*)projection_graph_[i].data(), sizeof(int) * nbr_size);
+//     }
+//     out.close();
+// }
 
 void IndexGPU::LoadVectorData(const char* base_file, const char* sampled_query_file) {
     int base_num = 0, sq_num = 0, base_dim = 0, q_dim = 0;

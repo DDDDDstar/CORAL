@@ -10,39 +10,39 @@
 #include "utils.cuh"
 
 namespace efanna2e {
-
 // kernel: 每个线程处理一个向量，把它加到对应的中心累加数组
-__global__ void compute_centroid_kernel(const float *__restrict__ data, float *center, int N,
-                                        int dim) {
-    const int tid = threadIdx.x, bid = blockIdx.x, tpb = blockDim.x, global_tid = bid * tpb + tid;
+// __global__ void compute_centroid_kernel(const float* __restrict__ data, float* center, int N,
+//                                         int dim) {
+//     const int tid = threadIdx.x, bid = blockIdx.x, tpb = blockDim.x, global_tid = bid * tpb +
+//     tid;
 
-    extern __shared__ float sh_center[];  // 每个 block 的共享内存，大小 = tpb * dim
-    for (int d = 0; d < dim; ++d) sh_center[tid * dim + d] = 0.0f;  // 初始化共享内存为 0
-    for (int i = global_tid; i < N; i += gridDim.x * tpb)           // 每个线程处理多个数据点
-        for (int d = 0; d < dim; ++d) sh_center[tid * dim + d] += data[i * dim + d];
-    __syncthreads();
+//     extern __shared__ float sh_center[];  // 每个 block 的共享内存，大小 = tpb * dim
+//     for (int d = 0; d < dim; ++d) sh_center[tid * dim + d] = 0.0f;  // 初始化共享内存为 0
+//     for (int i = global_tid; i < N; i += gridDim.x * tpb)           // 每个线程处理多个数据点
+//         for (int d = 0; d < dim; ++d) sh_center[tid * dim + d] += data[i * dim + d];
+//     __syncthreads();
 
-    for (int offset = tpb / 2; offset > 0;
-         offset >>= 1) {  // 使用归约将 block 内的向量累加到线程 0
-        if (tid < offset)
-            for (int d = 0; d < dim; ++d)
-                sh_center[tid * dim + d] += sh_center[(tid + offset) * dim + d];
-        __syncthreads();
-    }
+//     for (int offset = tpb / 2; offset > 0;
+//          offset >>= 1) {  // 使用归约将 block 内的向量累加到线程 0
+//         if (tid < offset)
+//             for (int d = 0; d < dim; ++d)
+//                 sh_center[tid * dim + d] += sh_center[(tid + offset) * dim + d];
+//         __syncthreads();
+//     }
 
-    for (int d = tid; d < dim; d += tpb)  // block 内的线程将结果写回全局中心数组
-        atomicAdd(&center[d], sh_center[d]);
-}
+//     for (int d = tid; d < dim; d += tpb)  // block 内的线程将结果写回全局中心数组
+//         atomicAdd(&center[d], sh_center[d]);
+// }
 
 // 单独 kernel 做归一化
-__global__ void normalize_centroid_kernel(float *center, int N, int dim) {
+__global__ void normalize_centroid_kernel(float* center, int N, int dim) {
     for (int d = threadIdx.x; d < dim; d += blockDim.x) center[d] /= N;
 }
 
 // bitset: 指向 int 数组；bit_index: 要访问的全局 bit 索引；返回值: 该 bit 的旧值 (0 or 1)
-__device__ int atomicTestAndSetBit(int *bitset, int bit_index) {
-    const int word_index = bit_index >> 5, bit_offset = bit_index & 31, mask = 1 << bit_offset;
-    int *addr = bitset + word_index, old_val = *addr, assumed;
+__device__ int atomicTestAndSetBit(int* bitset, int bit_index) {
+    const int mask = 1 << (bit_index & 31);
+    int *addr = bitset + (bit_index >> 5), old_val = *addr, assumed;
     while (true) {
         assumed = old_val;
         if (assumed & mask) return 1;  // 如果该位已经是 1，直接返回 1
@@ -53,8 +53,8 @@ __device__ int atomicTestAndSetBit(int *bitset, int bit_index) {
     }
 }
 
-__device__ float atomicMinFloat(float *address, float val) {
-    int *addr_as_int = (int *)address;
+__device__ float atomicMinFloat(float* address, float val) {
+    int* addr_as_int = (int*)address;
     int old = *addr_as_int, assumed;
 
     do {
@@ -66,8 +66,8 @@ __device__ float atomicMinFloat(float *address, float val) {
     return __int_as_float(old);
 }
 
-__device__ float atomicMaxFloat(float *address, float val) {
-    int *addr_as_int = (int *)address;
+__device__ float atomicMaxFloat(float* address, float val) {
+    int* addr_as_int = (int*)address;
     int old = *addr_as_int, assumed;
 
     do {
@@ -86,15 +86,15 @@ struct OffsetCalculator {
 };
 
 template <typename T1, typename T2>
-std::pair<T1 *, T2 *> temp_segmented_sort_pairs(  // 模板函数
-    T1 *targets, T2 *values, T1 *sort_targets, T2 *sort_values, int *offsets, cudaStream_t &stream,
+std::pair<T1*, T2*> temp_segmented_sort_pairs(  // 模板函数
+    T1* targets, T2* values, T1* sort_targets, T2* sort_values, int* offsets, cudaStream_t& stream,
     int batch, int n) {
     // 使用 counting_iterator 快速生成 offsets，步长：n
     thrust::counting_iterator<int> count_iter(0);
     thrust::transform(thrust::cuda::par.on(stream), count_iter, count_iter + batch + 1,
                       thrust::device_pointer_cast(offsets), OffsetCalculator(n));
 
-    void *temp_storage = nullptr;
+    void* temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
     // 使用 CUB CachingDeviceAllocator 缓存临时内存分配:
     static cub::CachingDeviceAllocator g_allocator(true);
@@ -119,10 +119,10 @@ std::pair<T1 *, T2 *> temp_segmented_sort_pairs(  // 模板函数
     return std::make_pair(targets_buffer.Current(), values_buffer.Current());
 }
 
-void segmented_sort_pairs_inplace(BCD *targets, float *values, int *offsets, cudaStream_t &stream,
+void segmented_sort_pairs_inplace(BCD* targets, float* values, int* offsets, cudaStream_t& stream,
                                   int batch, int n) {
-    BCD *targets_sort;
-    float *values_sort;
+    BCD* targets_sort;
+    float* values_sort;
     CUDA_CHECK(cudaMallocAsync(&targets_sort, batch * n * sizeof(BCD), stream));
     CUDA_CHECK(cudaMallocAsync(&values_sort, batch * n * sizeof(float), stream));
     auto res = temp_segmented_sort_pairs<BCD, float>(targets, values, targets_sort, values_sort,
@@ -133,23 +133,85 @@ void segmented_sort_pairs_inplace(BCD *targets, float *values, int *offsets, cud
     CUDA_CHECK(cudaFreeAsync(values_sort, stream));
 }
 
-std::pair<int *, float *> segmented_sort_pairs(int *targets, float *values, int *sort_targets,
-                                               float *sort_values, int *offsets,
-                                               cudaStream_t &stream, int batch, int n) {
+void sort_pairs(float* d_keys, BCD* d_values, int n, cudaStream_t& stream) {
+    thrust::device_ptr<float> keys_ptr(d_keys);
+    thrust::device_ptr<BCD> values_ptr(d_values);
+    thrust::sort_by_key(thrust::cuda::par.on(stream), keys_ptr, keys_ptr + n, values_ptr);
+}
+
+void sort_pairs(float* d_keys, int* d_values, int n, cudaStream_t& stream) {
+    thrust::device_ptr<float> keys_ptr(d_keys);
+    thrust::device_ptr<int> values_ptr(d_values);
+    thrust::sort_by_key(thrust::cuda::par.on(stream), keys_ptr, keys_ptr + n, values_ptr);
+}
+
+std::pair<int*, float*> segmented_sort_pairs(int* targets, float* values, int* sort_targets,
+                                             float* sort_values, int* offsets,
+                                             cudaStream_t& stream, int batch, int n) {
     return temp_segmented_sort_pairs<int, float>(targets, values, sort_targets, sort_values,
                                                  offsets, stream, batch, n);
 }
 
-void prefix_exclusive_sum(int *d_array, int *d_prefixsum, int N, cudaStream_t &stream) {
-    void *d_temp_storage = nullptr;
+void segmented_sort_pairs(BCD* targets, float* values, BCD* sort_targets, float* sort_values,
+                          int* offsets, cudaStream_t& stream, int batch, int n) {
+    auto res = temp_segmented_sort_pairs<BCD, float>(targets, values, sort_targets, sort_values,
+                                                     offsets, stream, batch, n);
+    CUDA_CHECK(
+        cudaMemcpyAsync(targets, res.first, n * sizeof(BCD), cudaMemcpyDeviceToDevice, stream));
+}
+
+void prefix_exclusive_sum(int* d_array, int* d_prefixsum, int N, cudaStream_t& stream) {
+    void* d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
 
-    // 第一次调用获取临时存储大小
     CUDA_CHECK(cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, d_array,
-                                             d_prefixsum, N, stream));
+                                             d_prefixsum, N,
+                                             stream));  // 第一次调用获取临时存储大小
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
-    // 第二次调用执行 prefix sum
     CUDA_CHECK(cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, d_array,
                                              d_prefixsum, N, stream));
 }
+
+void prefix_exclusive_sum(int* d_array, int* d_prefixsum, int N) {
+    void* d_temp_storage = nullptr;
+    size_t temp_storage_bytes = 0;
+
+    CUDA_CHECK(cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, d_array,
+                                             d_prefixsum, N));  // 第一次调用获取临时存储大小
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    CUDA_CHECK(cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, d_array,
+                                             d_prefixsum, N));  // 第二次调用执行 prefix sum
+}
+
+cudaEvent_t gpu_record_time_start(cudaStream_t stream) {
+    cudaEvent_t event;
+    cudaEventCreate(&event);
+    cudaEventRecord(event, stream);  // 在流中记录开始事件
+    return event;
+}
+
+float gpu_record_time_stop(cudaEvent_t start, cudaStream_t stream) {
+    float milliseconds = 0;
+    cudaEvent_t stop;
+    cudaEventCreate(&stop);
+    cudaEventRecord(stop, stream);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return milliseconds / 1000.0;
+}
+
+cudaEvent_t gpu_record_time_reset(cudaEvent_t start, cudaStream_t stream, float& time) {
+    float milliseconds = 0;
+    cudaEvent_t event;
+    cudaEventCreate(&event);
+    cudaEventRecord(event, stream);
+    cudaEventSynchronize(event);
+    cudaEventElapsedTime(&milliseconds, start, event);
+    cudaEventDestroy(start);
+    time = milliseconds / 1000.0;
+    return event;
+}
+
 }  // namespace efanna2e

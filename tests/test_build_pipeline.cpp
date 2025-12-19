@@ -22,12 +22,11 @@
 
 namespace po = boost::program_options;
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     std::string base_data_file;
     std::string sampled_query_data_file;
     // std::string query_data_file;
-    std::string bipartite_index_save_file, projection_index_save_file, learn_base_nn_file,
-        base_learn_nn_file;
+    std::string bipartite_index_save_file, learn_base_nn_file, base_learn_nn_file;
     std::string data_type;
     std::string dist, dataset;
     int M_sq;
@@ -37,7 +36,7 @@ int main(int argc, char **argv) {
     int CE;
     int k;
     float iso_thres, deg_thres, recall_thres, query_thres;
-    std::string cache_file, log_file, graph_file, recall_file;
+    std::string cache_file, log_file, graph_file, recall_file, query_file;
 
     po::options_description desc{"Arguments"};
     try {
@@ -113,7 +112,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         po::notify(vm);
-    } catch (const std::exception &ex) {
+    } catch (const std::exception& ex) {
         std::cerr << ex.what() << '\n';
         return -1;
     }
@@ -136,10 +135,10 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    float *data_bp = nullptr;
-    float *data_sq = nullptr;
-    float *aligned_data_bp = nullptr;
-    float *aligned_data_sq = nullptr;
+    float* data_bp = nullptr;
+    float* data_sq = nullptr;
+    float* aligned_data_bp = nullptr;
+    float* aligned_data_sq = nullptr;
     efanna2e::Parameters parameters;
     efanna2e::load_data<float>(base_data_file.c_str(), base_num, base_dim, data_bp);
     efanna2e::load_data<float>(sampled_query_data_file.c_str(), sq_num, sq_dim, data_sq);
@@ -167,18 +166,15 @@ int main(int argc, char **argv) {
 #endif
 #endif
     const std::string recall_thres_str = std::to_string(int(recall_thres));
-    const std::string gt_dir =
-        GT_PREFIX + dataset + "_" + dist + "_" + version + "_" + recall_thres_str;
-    projection_index_save_file = INDEX_PREFIX + dataset + "_" + dist + "_" + version + "_" +
-                                 recall_thres_str + "_" + date_time + ".index";
-    log_file = LOG_PREFIX + dataset + "_" + date_time + "_" + dist + "_" + version + "_" +
-               recall_thres_str + ".log";
+    const std::string gt_dir = GT_PREFIX + dataset + "/" + dist + "_" + recall_thres_str;
+    graph_file = INDEX_PREFIX + dataset + "/" + dist + "_" + date_time + "/";
+    log_file =
+        LOG_PREFIX + dataset + "/" + date_time + "_" + dist + "_" + recall_thres_str + ".log";
     recall_file = RECALL_PREFIX + dataset + "_" + dist + "_" + version + ".csv";
     cache_file = gt_dir + "/knn.cache";
-    graph_file = gt_dir + "/graph.cache";
-    efanna2e::fo.print("Index save path: " + projection_index_save_file +
-                       "\nlog path: " + log_file + "\nrecall path: " + recall_file +
-                       "\nknn cache path: " + cache_file + "\ngraph cache path: " + graph_file);
+    query_file = gt_dir + "/query.cache";
+    efanna2e::fo.print("Index graph save path: " + graph_file + "\nlog path: " + log_file +
+                       "\nrecall path: " + recall_file + "\nknn cache path: " + cache_file);
 
     efanna2e::IndexGPU index(base_dim, base_num + sq_num, dist_metric, nullptr);
     // parameters.Set<int>("M_bp", M_bp);
@@ -190,7 +186,9 @@ int main(int argc, char **argv) {
     parameters.Set<int>("CE", CE);
     parameters.Set<int>("k", k);
     parameters.Set<std::string>("cache_file", cache_file);
+    parameters.Set<std::string>("base_file", base_data_file);
     parameters.Set<std::string>("graph_file", graph_file);
+    parameters.Set<std::string>("query_file", query_file);
     parameters.Set<std::string>("log_file", log_file);
     parameters.Set<std::string>("recall_file", recall_file);
     parameters.Set<std::string>("dist", dist);
@@ -208,8 +206,8 @@ int main(int argc, char **argv) {
     std::chrono::duration<double> diff = e - s;
 
     efanna2e::fo.iprint("indexing time: " + std::to_string(diff.count()));
-    index.SaveIndex(projection_index_save_file.c_str());
-    efanna2e::fo.print("Save index to " + projection_index_save_file);
+    // index.SaveIndex(projection_index_save_file.c_str());
+    efanna2e::fo.print("Save index to " + graph_file);
 
     return 0;
 }

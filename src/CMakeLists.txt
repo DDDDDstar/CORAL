@@ -1,35 +1,22 @@
-
 file(GLOB_RECURSE CPP_SOURCES *.cpp)
 file(GLOB_RECURSE CUDA_SOURCES *.cu)
 
-# 查找BLAS库
-find_package(BLAS REQUIRED)
-message(STATUS "BLAS libraries: ${BLAS_LIBRARIES}")
+# 创建共享库
+add_library(efanna2e SHARED ${CPP_SOURCES} ${CUDA_SOURCES})
 
-find_library(NVML_LIB 
-    NAMES nvidia-ml 
-    PATHS /usr/lib/x86_64-linux-gnu
-    REQUIRED)
-
-add_library(${PROJECT_NAME} ${CPP_SOURCES} ${CUDA_SOURCES})
-
-set_target_properties(${PROJECT_NAME} PROPERTIES
-  CUDA_ARCHITECTURES "80"
-  POSITION_INDEPENDENT_CODE ON
+# 设置 target properties
+set_target_properties(efanna2e PROPERTIES
+    CUDA_ARCHITECTURES 80
+    POSITION_INDEPENDENT_CODE ON
 )
 
-target_link_libraries(${PROJECT_NAME} 
-    ${BLAS_LIBRARIES} 
-    ${CUDA_LIBRARIES} 
-    ${NVML_LIB})
-
-add_library(${PROJECT_NAME}_s STATIC ${CPP_SOURCES} ${CUDA_SOURCES})
-
-set_target_properties(${PROJECT_NAME}_s PROPERTIES
-  CUDA_ARCHITECTURES "80"
-  POSITION_INDEPENDENT_CODE ON
+# 链接库
+target_link_libraries(efanna2e PRIVATE
+    ${CUDA_CUDART_LIBRARY}
+    faiss
+    faiss_gpu
+    ${BLAS_LIBRARIES}
+    ${NVML_LIB}
+    # ${LZ4_LIBRARY}
+    OpenMP::OpenMP_CXX
 )
-target_link_libraries(${PROJECT_NAME}_s 
-    ${BLAS_LIBRARIES} 
-    ${CUDA_LIBRARIES} 
-    ${NVML_LIB})
