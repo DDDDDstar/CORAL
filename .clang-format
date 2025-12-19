@@ -1,7 +1,0 @@
-BasedOnStyle: Google
-IndentWidth: 4         # 每一级缩进 4 个空格
-TabWidth: 4            # Tab 的宽度 = 4
-UseTab: Never          # 不用真正的 Tab，而是插入空格
-ColumnLimit: 99   # 一行的最大长度限制，超出就会自动换行
-BraceWrapping:
-  AfterControlStatement: Never

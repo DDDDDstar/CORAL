@@ -1,6 +1,8 @@
 build/
-data/
+data
 logs/
 gts/
 indexes/
 thirdparty/
+.clang-format
+.vscode/
