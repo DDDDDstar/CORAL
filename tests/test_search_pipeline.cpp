@@ -77,7 +77,6 @@ int main(int argc, char** argv) {
     std::string dist;
     std::string dataset;
     std::vector<int> L_vec;
-    // int L_pq;
     int num_threads;
     int k, max_degree;
     double max_recall, max_hop;
@@ -103,7 +102,7 @@ int main(int argc, char** argv) {
                            "Query file in bin format");
         desc.add_options()("gt_path", po::value<std::string>(&gt_file)->required(),
                            "Groundtruth file in bin format");
-        desc.add_options()("L_pq", po::value<std::vector<int>>(&L_vec)->multitoken(),
+        desc.add_options()("L", po::value<std::vector<int>>(&L_vec)->multitoken(),
                            "Priority queue length for searching");
         desc.add_options()("max_recall", po::value<double>(&max_recall)->default_value(0),
                            "Max recall required to reach, must > 0.5");
@@ -271,10 +270,10 @@ int main(int argc, char** argv) {
         exit(1);
     }
     // std::cout << "Using thread: " << num_threads << std::endl;
-    std::cout << "L_pq" << "\t\tQPS" << "\t\tavg_time" << "\t\trecall@" << k << "\t\tavg_hops"
+    std::cout << "L" << "\t\tQPS" << "\t\tavg_time" << "\t\trecall@" << k << "\t\tavg_hops"
               << std::endl;
-    evaluation_out << "L_pq, QPS, time, recall@" << k << ", avg_hops" << std::endl;
-    fo.iprint("L_pq, QPS, time, recall@" + TOS(k) + ", avg_hops");
+    evaluation_out << "L, QPS, time, recall@" << k << ", avg_hops" << std::endl;
+    fo.iprint("L, QPS, time, recall@" + TOS(k) + ", avg_hops");
     float recall;
     if (L_vec.size() == 0 && max_recall > 0.5) {
         L_vec.push_back(128);
@@ -282,25 +281,25 @@ int main(int argc, char** argv) {
 
     // for (int i = 0; i < 3; ++i) {
     for (int i = 0; i < L_vec.size(); ++i) {
-        int L_pq = L_vec[i];
-        if (k > L_pq) {
-            std::cout << "L_pq must greater or equal than k" << std::endl;
+        int L = L_vec[i];
+        if (k > L) {
+            std::cout << "L must greater or equal than k" << std::endl;
             exit(1);
         }
 
         auto tr = index_type == ""
-                      ? index.Search(aligned_query_data.data(), q_pts * copy_n, L_pq, res)
-                      : index.Search(aligned_query_data.data(), q_pts * copy_n, L_pq, res, 1);
+                      ? index.Search(aligned_query_data.data(), q_pts * copy_n, L, res)
+                      : index.Search(aligned_query_data.data(), q_pts * copy_n, L, res, 1);
 
         const float qps = (float)q_pts * copy_n / tr.get_time(), time = tr.get_time();
         recall = ComputeRecall(q_pts, k, gt_dim, res, gt_ids);
         const float avg_hops = tr.avg_hops(q_pts * copy_n);
-        std::cout << L_pq << "\t\t" << qps << "\t\t" << time << "\t\t" << recall << "\t\t"
-                  << avg_hops << std::endl;
+        std::cout << L << "\t\t" << qps << "\t\t" << time << "\t\t" << recall << "\t\t" << avg_hops
+                  << std::endl;
 
-        evaluation_out << L_pq << "," << qps << "," << time << "," << recall << "," << avg_hops
+        evaluation_out << L << "," << qps << "," << time << "," << recall << "," << avg_hops
                        << std::endl;
-        fo.print(TOS(L_pq) + ", " + TOS(qps) + ", " + TOS(time) + ", " + TOS(recall) + ", " +
+        fo.print(TOS(L) + ", " + TOS(qps) + ", " + TOS(time) + ", " + TOS(recall) + ", " +
                  TOS(avg_hops));
 
         if (max_recall > 0.5 && recall < max_recall) {

@@ -50,7 +50,8 @@ class IndexGPU : public Index {
     virtual void Build(size_t n, const float* data, const Parameters& parameters) override;
     virtual void Search(const float* query, const float* x, size_t k, const Parameters& parameters,
                         unsigned* indices, float* res_dists) override;
-    Test_Result Search_and_Verify(const float* queries, const int* gts, int num);
+    Test_Result Search_and_Verify(const float* queries, const int* gts, int num,
+                                  int beam_capacity = 0);
     Test_Result Search(const float* queries, int num, int beam_capacity, int* ids_res, int M = 0);
     void Delete(const std::vector<int> del_ids);
     void Insert(const float* ins_vectors, int ins_num);

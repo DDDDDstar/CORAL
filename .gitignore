@@ -2,7 +2,7 @@
 /bench
 /build
 /data
-/data_prepare
+/data_prepare/faiss_gt.sh
 /evaluation
 /exp_scripts
 /gts
@@ -11,7 +11,6 @@
 /thirdparty
 /.clang-format
 /cagra_run.sh
-/config.json
 /prepare.sh
 
 /include/cagra.h
@@ -32,9 +31,7 @@
 /src/upd_test.cpp
 /src/upd.cu
 
-/tests/comp_gt.cpp
 /tests/faiss_gt.cu
 /tests/faiss_pq.cu
 /tests/test_cagra.cu
 /tests/test_faiss.cu
-/tests/update_compute_gt.cpp

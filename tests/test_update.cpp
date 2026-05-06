@@ -33,7 +33,7 @@ int main(int argc, char** argv) {
     std::string data_type;
     std::string dist, dataset;
     int max_degree;
-    int k;
+    int k, upd_mode, L;
     std::string graph_file, query_cache_file, log_file, cache_file;
     float recall_thres, query_thres;
     // std::string evaluation_save_file;
@@ -63,8 +63,11 @@ int main(int argc, char** argv) {
                            "Number of neighbors for graph");
         desc.add_options()("k", po::value<int>(&k)->default_value(1)->required(),
                            "k nearest neighbors");
+        desc.add_options()("L", po::value<int>(&L)->default_value(512)->required(),
+                           "k nearest neighbors");
         desc.add_options()("query_path", po::value<std::string>(&query_file)->required(),
                            "Query file in bin format");
+        desc.add_options()("upd_mode", po::value<int>(&upd_mode)->required(), "update mode");
 
         desc.add_options()("config_file",
                            po::value<std::string>(&config_file)->default_value("default"),
@@ -83,6 +86,9 @@ int main(int argc, char** argv) {
         std::cerr << ex.what() << '\n';
         return -1;
     }
+
+    PC.upd_mode = upd_mode;
+
     size_t base_num, sq_num, query_num;
     int base_dim, sq_dim, query_dim;
     efanna2e::load_meta<float>(base_data_file.c_str(), base_num, base_dim);
@@ -130,7 +136,7 @@ int main(int argc, char** argv) {
     create_dir(fpath(gt_dir));
     graph_file = INDEX_PREFIX + dataset_dist;
     query_cache_file = gt_dir + "/query.cache";
-    log_file = UPD_LOG_PREFIX + dataset + "_" + dist + "_" + TOS(PC.upd_mode) + "_" +
+    log_file = UPD_LOG_PREFIX + dataset + "_" + dist + "_" + TOS(upd_mode) + "_" +
                TOS(PC.upd_type) + ".log";
     // evaluation_save_file = UPD_EVALUATION_PREFIX + dataset + "/" + date_time + "_" + dist +
     // ".csv";
@@ -155,11 +161,11 @@ int main(int argc, char** argv) {
     auto s = std::chrono::high_resolution_clock::now();
     namespace fs = std::filesystem;
     fpath evaluation_save_file =
-        fpath(EVALUATION_PREFIX) / "upd" / (TOS(PC.upd_mode) + "_" + TOS(PC.upd_type) + ".csv");
+        fpath(EVALUATION_PREFIX) / "upd" / (TOS(upd_mode) + "_" + TOS(PC.upd_type) + ".csv");
 
-    if (PC.upd_mode == 1)
+    if (upd_mode == 1)
         update_gt_file += ".del";
-    else if (PC.upd_mode == 2)
+    else if (upd_mode == 2)
         update_gt_file += ".ins";
     std::ifstream gt_file(update_gt_file, std::ios::binary);
     std::ofstream eva_file(evaluation_save_file, std::ios::out);
@@ -188,7 +194,7 @@ int main(int argc, char** argv) {
     }
 
     index.RunPrepare(parameters, Mode::UPD, base_num, aligned_data_bp);
-    auto tr = index.Search_and_Verify(aligned_query_data, gts.data(), query_num);
+    auto tr = index.Search_and_Verify(aligned_query_data, gts.data(), query_num, L);
     eva_file << "0, " << tr.calc_recall(query_num * k) << ", " << tr.avg_hops(query_num) << ", "
              << tr.get_time() << ", " << query_num / tr.get_time() << std::endl;
     fo.iprint("Search result: recall=" + TOS(tr.calc_recall(query_num * k)) +
@@ -196,7 +202,7 @@ int main(int argc, char** argv) {
               ", qps=" + TOS(query_num / tr.get_time()));
     const size_t batch = (upd_num + round - 1) / round;
     std::vector<int> del_ids;
-    if (PC.upd_mode == 0) {
+    if (upd_mode == 0) {
         for (int batch_i = 0; batch_i < round; batch_i++) {
             const size_t upd_n = std::min(batch, upd_num - batch_i * batch),
                          insert_start_id = base_num + batch_i * batch;
@@ -210,7 +216,7 @@ int main(int argc, char** argv) {
             if ((batch_i + 1) % 4 != 0) continue;
 
             auto tr = index.Search_and_Verify(
-                aligned_query_data, gts.data() + query_num * k * (batch_i + 1), query_num);
+                aligned_query_data, gts.data() + query_num * k * (batch_i + 1), query_num, L);
             eva_file << batch_i + 1 << ", " << tr.calc_recall(query_num * k) << ", "
                      << tr.avg_hops(query_num) << ", " << tr.get_time() << ", "
                      << query_num / tr.get_time() << std::endl;
@@ -219,7 +225,7 @@ int main(int argc, char** argv) {
                       "%, avg_hops=" + TOS(tr.avg_hops(query_num)) + ", time=" +
                       TOS(tr.get_time()) + "s" + ", qps=" + TOS(query_num / tr.get_time()));
         }
-    } else if (PC.upd_mode == 4) {
+    } else if (upd_mode == 4) {
         for (int batch_i = 0; batch_i < round; batch_i++) {
             const size_t upd_n = std::min(batch, upd_num - batch_i * batch),
                          insert_start_id = base_num + batch_i * batch;
@@ -227,7 +233,7 @@ int main(int argc, char** argv) {
             std::iota(del_ids.begin(), del_ids.end(), batch_i * batch);
             index.Delete(del_ids);
             auto dtr = index.Search_and_Verify(
-                aligned_query_data, gts.data() + query_num * k * (batch_i + 1) * 2, query_num);
+                aligned_query_data, gts.data() + query_num * k * (batch_i + 1) * 2, query_num, L);
             fo.iprint(
                 "Batch " + TOS(batch_i) + "/" + TOS(round) +
                 " Search result after delete: recall=" + TOS(dtr.calc_recall(query_num * k)) +
@@ -237,7 +243,7 @@ int main(int argc, char** argv) {
             // gt_file.read(reinterpret_cast<char*>(gts.data()), sizeof(int) * query_num * k);
             auto tr = index.Search_and_Verify(
                 aligned_query_data, gts.data() + query_num * k * (batch_i + 1) * 2 + query_num * k,
-                query_num);
+                query_num, L);
             eva_file << batch_i + 1 << ", " << tr.calc_recall(query_num * k) << ", "
                      << tr.avg_hops(query_num) << ", " << tr.get_time() / query_num << ", "
                      << query_num / tr.get_time() << "\n";
@@ -246,7 +252,7 @@ int main(int argc, char** argv) {
                       "%, avg_hops=" + TOS(tr.avg_hops(query_num)) +
                       ", time=" + TOS(tr.get_time()) + "s");
         }
-    } else if (PC.upd_mode == 1) {
+    } else if (upd_mode == 1) {
         for (int batch_i = 0; batch_i < round / 2; batch_i++) {
             const size_t upd_n = std::min(batch, upd_num - batch_i * batch);
             del_ids.resize(upd_n);
@@ -255,7 +261,7 @@ int main(int argc, char** argv) {
             // index.Insert(aligned_data_bp + insert_start_id * base_dim, upd_n);
             // gt_file.read(reinterpret_cast<char*>(gts.data()), sizeof(int) * query_num * k);
             auto tr = index.Search_and_Verify(
-                aligned_query_data, gts.data() + query_num * k * (batch_i + 1), query_num);
+                aligned_query_data, gts.data() + query_num * k * (batch_i + 1), query_num, L);
             eva_file << batch_i + 1 << ", " << tr.calc_recall(query_num * k) << ", "
                      << tr.avg_hops(query_num) << ", " << tr.get_time() / query_num << ", "
                      << query_num / tr.get_time() << "\n";
@@ -271,7 +277,7 @@ int main(int argc, char** argv) {
             index.Insert(aligned_data_bp + insert_start_id * base_dim, upd_n);
             // gt_file.read(reinterpret_cast<char*>(gts.data()), sizeof(int) * query_num * k);
             auto tr = index.Search_and_Verify(
-                aligned_query_data, gts.data() + query_num * k * (batch_i + 1), query_num);
+                aligned_query_data, gts.data() + query_num * k * (batch_i + 1), query_num, L);
             eva_file << batch_i + 1 << ", " << tr.calc_recall(query_num * k) << ", "
                      << tr.avg_hops(query_num) << ", " << tr.get_time() / query_num << ", "
                      << query_num / tr.get_time() << "\n";

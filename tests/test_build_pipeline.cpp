@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
         desc.add_options()(
             "M_sq", po::value<int>(&M_sq)->default_value(32),
             "Number of neighbors for sampled query points to build the bipartite graph");
-        desc.add_options()("M_pjbp", po::value<int>(&M_pjbp)->default_value(32),
+        desc.add_options()("M_pjbp", po::value<int>(&max_degree)->default_value(32),
                            "Number of neighbors for projection graph");
         desc.add_options()("L_pjpq", po::value<int>(&L_pjpq)->default_value(32),
                            "Priority queue length for projection graph searching");
@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
         //                    "The threshold of the avg degree of nodes");
         desc.add_options()("recall_thres", po::value<float>(&recall_thres)->default_value(100),
                            "The threshold of the recall of index");
-        desc.add_options()("query_thres", po::value<float>(&query_thres)->default_value(10.0),
+        desc.add_options()("query_thres", po::value<float>(&query_thres)->default_value(100.0),
                            "The threshold of the size of query data");
         // desc.add_options()("cache_file", po::value<std::string>(&cache_file)->required(),
         //                    "file path to cache GT");

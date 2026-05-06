@@ -1,0 +1,40 @@
+{
+    "dim": 200,
+    "k": 100,
+    "max_degree": 32,
+    "batch": 1024, 
+    "enhance_nap_batch": 4096,
+    "enhance_search_batch" : 524288,
+    "enhance_beam_capacity": 100,
+    "enhance_query_num" : 1,
+    "enhance_mode": 0,
+    
+
+    "use_knn_cache" :0,
+    
+    "need_discard": 1,
+    
+    "knn_rebuild": 0,
+    "knn_max_hit" : 3,
+    "knn_rebuild_thres": 1000000,
+
+    "ivf_rebuild": 1,
+    "ivf_nlist":4096,
+    "ivf_nprobe": 32,
+    "ivf_points_per_centroid": 256,
+
+    "test_search": 1,
+    "beam_capacity": 1024,
+    "test_beam_capacity" : 512,
+    "search_start_nodes_num" : 16,
+    "test_search_frequency":100,
+
+    "top_hit_num": 5000000,
+
+    "upd_mode": 0,
+    "upd_type": 3,
+    "upd_build": 1,
+    "insert_batch" : 2048,
+    "insert_query_k": 16
+    
+}

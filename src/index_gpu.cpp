@@ -86,7 +86,8 @@ void IndexGPU::load_config(const std::string& config_file) {
     PC.knn_rebuild_min_cnt = j.value("knn_rebuild_min_cnt", 2000000);
 }
 
-Test_Result IndexGPU::Search_and_Verify(const float* queries, const int* gts, int num) {
+Test_Result IndexGPU::Search_and_Verify(const float* queries, const int* gts, int num,
+                                        int beam_capacity) {
     Test_Result tr;
     float* d_queries;
     int *d_ids_res, *d_ids_gt;
@@ -98,7 +99,10 @@ Test_Result IndexGPU::Search_and_Verify(const float* queries, const int* gts, in
 
     static bool init = false;
     if (!init) {
-        gpufuncs->search_prepare(num);
+        if (beam_capacity > 0)
+            gpufuncs->search_prepare(num, beam_capacity);
+        else
+            gpufuncs->search_prepare(num);
         init = true;
     }
     tr = gpufuncs->Search(d_queries, d_ids_res, nullptr, num, graph->get_start_ids());
