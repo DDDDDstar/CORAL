@@ -4,7 +4,7 @@ CORAL is a novel GPU-accelerated graph-based vector index for scalable cross-mod
 CORAL incrementally incorporates the characteristics of query modal and timely stops index construction.
 CORAL also supports modal-semantics-based vector insertion and topology-repairing deletion that restore node connectivity.
 
-<img src="./README.assets/def.pdf" alt="image-20260506下午44123908" style="zoom:200%;" />
+<img src="./README.assets/def.png" alt="def" style="zoom:200%;" id="def" />
 
 ## Getting Started
 
@@ -36,13 +36,13 @@ sudo apt install libaio-dev libgoogle-perftools-dev clang-format libboost-all-de
 
 The dataset information is as follows. $|D|$ is the size of the base dataset, and $|Q_b|$ is the size of the auxiliary query set.
 
-|      Dataset       | Dim  | Metric | $|D|$ | $|Q_b|$  | Modalities <br />(base, query) |
-| :----------------: | :--: | :----: | :---: | :------: | ------------------------------ |
-| Text-to-Image(T2I) | 200  |   L2   | 1M~1B | 0.1M~30M | Image, Text                    |
-|       WebVid       | 512  |   IP   | 2.5M  |    1M    | Video, Text                    |
-|       LAION        | 512  |   IP   |  10M  |    1M    | Image, Text                    |
-|        WIT         | 512  |   IP   |  1M   |   0.1M   | Image, Text                    |
-|        CC3M        | 512  |   IP   |  1M   |   0.1M   | Image, Text                    |
+| Dataset | Dim | Metric | \|D\| | \|Q_b\| | Modalities <br />(base, query) |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| Text-to-Image (T2I) | 200 | L2 | 1M~1B | 0.1M~30M | Image, Text |
+| WebVid | 512 | IP | 2.5M | 1M | Video, Text |
+| LAION | 512 | IP | 10M | 1M | Image, Text |
+| WIT | 512 | IP | 1M | 0.1M | Image, Text |
+| CC3M | 512 | IP | 1M | 0.1M | Image, Text |
 
 We use `./data_prepare/prepare_data.sh` to prepare the train and test data of each dataset, including the base data file `base.fbin`, the query data file for index construction `query.train.fbin`, the query data file for test `query.fbin`, and the gt data file `query.gt.bin`.
 
@@ -50,7 +50,7 @@ For example, to prepare the data of 1M-scale T2I dataset:
 
 ```bash
 ./data_prepare/prepare_data.sh t2i-1M
-```
+```Supplement the readme document and add relevant code content.
 
 The data files will be saved in the `./data` directory.
 
@@ -64,7 +64,7 @@ mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Debug && make -j
 
 The index construction workflow is as follows.
 
-<img src="./README.assets/base.pdf" alt="image-20260506下午44123908" style="zoom:200%;" />
+<img src="./README.assets/base.png" alt="image-20260506下午44123908" style="zoom:200%;" />
 
 To build the index:
 
@@ -94,7 +94,7 @@ The index will be saved in `./indexes` directory.
 
  The overview of the index search and update is as follows.
 
-<img src="./README.assets/sid.pdf" alt="image-20260506下午44123908" style="zoom:200%;" />
+<img src="./README.assets/sid.png" alt="image-20260506下午44123908" style="zoom:200%;" />
 
 To search on the index:
 
