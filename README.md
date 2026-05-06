@@ -36,7 +36,7 @@ sudo apt install libaio-dev libgoogle-perftools-dev clang-format libboost-all-de
 
 The dataset information is as follows. $|D|$ is the size of the base dataset, and $|Q_b|$ is the size of the auxiliary query set.
 
-| Dataset | Dim | Metric | \|D\| | \|Q_b\| | Modalities <br />(base, query) |
+| Dataset | Dim | Metric | \|D\| | \|Q\_b\| | Modalities <br />(base, query) |
 | :---: | :---: | :---: | :---: | :---: | :--- |
 | Text-to-Image (T2I) | 200 | L2 | 1M~1B | 0.1M~30M | Image, Text |
 | WebVid | 512 | IP | 2.5M | 1M | Video, Text |
@@ -50,7 +50,7 @@ For example, to prepare the data of 1M-scale T2I dataset:
 
 ```bash
 ./data_prepare/prepare_data.sh t2i-1M
-```Supplement the readme document and add relevant code content.
+```
 
 The data files will be saved in the `./data` directory.
 
